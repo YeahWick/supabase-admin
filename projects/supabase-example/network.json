@@ -1,0 +1,4 @@
+{
+  "dbAllowedCidrs": [],
+  "_comment": "Empty array means allow all connections. Add CIDRs like '203.0.113.0/24' to restrict."
+}

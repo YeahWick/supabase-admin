@@ -1,0 +1,6 @@
+{
+  "requestedConfig": {
+    "database": true
+  },
+  "_comment": "When database is true, SSL is enforced for all database connections."
+}
