@@ -1,0 +1,35 @@
+name: List Projects
+
+on:
+  workflow_dispatch:
+
+jobs:
+  list:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch projects
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+        run: |
+          response=$(curl -s -w "\n%{http_code}" \
+            -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
+            https://api.supabase.com/v1/projects)
+
+          http_code=$(echo "$response" | tail -1)
+          body=$(echo "$response" | sed '$d')
+
+          if [ "$http_code" -ne 200 ]; then
+            echo "::error::API returned HTTP $http_code"
+            echo "$body"
+            exit 1
+          fi
+
+          echo "## Supabase Projects" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Name | Ref | Region | Status | Created |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|------|-----|--------|--------|---------|" >> "$GITHUB_STEP_SUMMARY"
+
+          echo "$body" | jq -r '.[] | "| \(.name) | `\(.id)` | \(.region) | \(.status) | \(.created_at) |"' >> "$GITHUB_STEP_SUMMARY"
+
+          echo ""
+          echo "Projects found: $(echo "$body" | jq length)"

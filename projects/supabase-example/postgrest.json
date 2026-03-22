@@ -1,0 +1,5 @@
+{
+  "db_schema": "public",
+  "max_rows": 1000,
+  "db_extra_search_path": "public,extensions"
+}

@@ -10,6 +10,8 @@
 
 All workflows use `curl` against `https://api.supabase.com/v1/` with the PAT in `Authorization: Bearer ${{ secrets.SUPABASE_ACCESS_TOKEN }}`. No CLI or SDK dependencies — just shell + jq. Workflows are `workflow_dispatch` so they can be triggered manually from the Actions tab (and later called from other workflows).
 
+Per-project configs live under `projects/<project-name>/`. Workflows accept a `project_name` input to select which config directory to use, plus a `project_ref` for the Supabase API calls.
+
 ---
 
 ## Phase 1 — Inspection / Read-Only Workflows (MVP)
@@ -56,34 +58,32 @@ These workflows **read** state and output it. No mutations.
 
 ## Phase 2 — GitOps / Mutation Workflows
 
-These workflows **apply desired state** from config files or inputs.
+These workflows **apply desired state** from per-project config files in the repo.
 
 ### 7. `apply-auth-config.yml`
-- **Input:** `project_ref` + reads `config/auth.json` from repo
+- **Input:** `project_name` + `project_ref`
+- **Config:** `projects/<project_name>/auth.json`
 - **Endpoint:** `PATCH /v1/projects/{ref}/config/auth`
 - **Flow:** Reads desired auth config from repo → diffs against current → applies patch
 - **Use case:** Enable/disable providers, set JWT expiry, configure MFA, etc.
 
 ### 8. `apply-postgrest-config.yml`
-- **Input:** `project_ref` + reads `config/postgrest.json` from repo
+- **Input:** `project_name` + `project_ref`
+- **Config:** `projects/<project_name>/postgrest.json`
 - **Endpoint:** `PATCH /v1/projects/{ref}/postgrest`
 - **Flow:** Apply PostgREST settings (exposed schemas, max rows, etc.)
 
-### 9. `apply-secrets.yml`
-- **Input:** `project_ref` + reads `config/secrets.json` from repo
-- **Endpoint:** `POST /v1/projects/{ref}/secrets`
-- **Flow:** Upsert secrets from config into the project
-- **Note:** Secret *values* should come from GitHub secrets, config only defines names/mapping
-
-### 10. `apply-network-restrictions.yml`
-- **Input:** `project_ref` + reads `config/network.json` from repo
+### 9. `apply-network-restrictions.yml`
+- **Input:** `project_name` + `project_ref`
+- **Config:** `projects/<project_name>/network.json`
 - **Endpoints:**
   - `PATCH /v1/projects/{ref}/network-restrictions`
   - `POST /v1/projects/{ref}/network-restrictions/apply`
 - **Flow:** Set allowed CIDRs for database access
 
-### 11. `apply-ssl-enforcement.yml`
-- **Input:** `project_ref` + reads `config/ssl.json` from repo
+### 10. `apply-ssl-enforcement.yml`
+- **Input:** `project_name` + `project_ref`
+- **Config:** `projects/<project_name>/ssl.json`
 - **Endpoint:** `PUT /v1/projects/{ref}/ssl-enforcement`
 - **Flow:** Enforce or relax SSL requirements
 
@@ -102,24 +102,27 @@ These workflows **apply desired state** from config files or inputs.
     list-secrets.yml
     apply-auth-config.yml
     apply-postgrest-config.yml
-    apply-secrets.yml
     apply-network-restrictions.yml
     apply-ssl-enforcement.yml
-config/
-  auth.json              # desired auth config
-  postgrest.json         # desired PostgREST config
-  secrets.json           # secret name → GitHub secret mapping
-  network.json           # allowed CIDRs
-  ssl.json               # SSL enforcement config
+projects/
+  supabase-example/           # per-project config (todo app)
+    auth.json                 # auth config: anonymous sign-in enabled
+    postgrest.json            # PostgREST: public schema, default max rows
+    network.json              # allowed CIDRs (empty = allow all)
+    ssl.json                  # SSL enforcement settings
+    README.md                 # project notes / reference
 ```
 
 ---
 
-## Implementation Order
+## Example Project: supabase-example
 
-1. **Start with Phase 1** (read-only) — ship all 6 inspection workflows
-2. **Add `config/` scaffolding** — example JSON files with comments
-3. **Ship Phase 2** one workflow at a time, starting with `apply-auth-config.yml`
+Based on [YeahWick/supabase-example](https://github.com/YeahWick/supabase-example) — a todo app using:
+- **Anonymous auth** (no sign-up required)
+- **PostgREST** on `public` schema with `todos` table
+- **Row Level Security** for per-user isolation
+
+The config files under `projects/supabase-example/` codify the desired state for this app.
 
 ---
 
@@ -127,5 +130,5 @@ config/
 
 - All workflows use `ubuntu-latest` runner, only need `curl` + `jq` (pre-installed)
 - Rate limit: 120 req/min per project — not a concern for manual dispatch
-- Mutation workflows should always **GET current → diff → PATCH** so the job summary shows what changed
+- Mutation workflows always **GET current → diff → PATCH** so the job summary shows what changed
 - Sensitive output (API keys, secrets) is masked in logs via `::add-mask::`

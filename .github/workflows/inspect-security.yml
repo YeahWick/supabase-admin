@@ -1,0 +1,68 @@
+name: Inspect Security
+
+on:
+  workflow_dispatch:
+    inputs:
+      project_ref:
+        description: 'Supabase project ref'
+        required: true
+        type: string
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch security posture
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          PROJECT_REF: ${{ inputs.project_ref }}
+        run: |
+          api="https://api.supabase.com/v1"
+          auth="Authorization: Bearer $SUPABASE_ACCESS_TOKEN"
+
+          ssl=$(curl -s -H "$auth" "$api/projects/$PROJECT_REF/ssl-enforcement")
+          network=$(curl -s -H "$auth" "$api/projects/$PROJECT_REF/network-restrictions")
+          sec_advisors=$(curl -s -H "$auth" "$api/projects/$PROJECT_REF/advisors/security")
+          perf_advisors=$(curl -s -H "$auth" "$api/projects/$PROJECT_REF/advisors/performance")
+
+          echo "## Security Posture — $PROJECT_REF" >> "$GITHUB_STEP_SUMMARY"
+
+          # SSL
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### SSL Enforcement" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo '```json' >> "$GITHUB_STEP_SUMMARY"
+          echo "$ssl" | jq '.' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+          # Network restrictions
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Network Restrictions" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo '```json' >> "$GITHUB_STEP_SUMMARY"
+          echo "$network" | jq '.' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+          # Security advisors
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Security Advisors" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          if echo "$sec_advisors" | jq -e 'type == "array" and length > 0' > /dev/null 2>&1; then
+            echo "| Issue | Severity | Details |" >> "$GITHUB_STEP_SUMMARY"
+            echo "|-------|----------|---------|" >> "$GITHUB_STEP_SUMMARY"
+            echo "$sec_advisors" | jq -r '.[] | "| \(.title // .name // "—") | \(.severity // "—") | \(.description // "—") |"' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No security advisories." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          # Performance advisors
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Performance Advisors" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          if echo "$perf_advisors" | jq -e 'type == "array" and length > 0' > /dev/null 2>&1; then
+            echo "| Issue | Severity | Details |" >> "$GITHUB_STEP_SUMMARY"
+            echo "|-------|----------|---------|" >> "$GITHUB_STEP_SUMMARY"
+            echo "$perf_advisors" | jq -r '.[] | "| \(.title // .name // "—") | \(.severity // "—") | \(.description // "—") |"' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No performance advisories." >> "$GITHUB_STEP_SUMMARY"
+          fi
