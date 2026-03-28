@@ -1,61 +1,142 @@
 # supabase-admin
 
-Infrastructure as Code for managing Supabase projects via GitHub Actions workflows. No CLI or SDK required — just `curl` + `jq` against the [Supabase Management API](https://api.supabase.com/v1).
+A reusable GitHub Action for managing Supabase project configuration as code. Drop it into any repo to apply auth, PostgREST, network, and SSL settings via the [Supabase Management API](https://api.supabase.com/v1) — no CLI or SDK required.
 
-## How it works
+## Quick start
 
-All workflows authenticate with a Supabase Personal Access Token (PAT) stored as a GitHub Actions secret. Workflows are `workflow_dispatch` so they can be triggered manually from the Actions tab.
+### 1. Add config files to your repo
 
-Per-project configuration lives under `projects/<project-name>/`. Mutation workflows read desired state from those files and apply it to the target project via the API.
+Create a `.supabase/` directory (or any directory you prefer) with the configs you want to manage:
 
-## Setup
+```
+your-repo/
+  .supabase/
+    auth.json          # Auth settings (providers, JWT expiry, MFA, etc.)
+    postgrest.json     # PostgREST settings (exposed schemas, max rows, etc.)
+    network.json       # Allowed CIDRs for database access
+    ssl.json           # SSL enforcement settings
+```
 
-Add the following secret to your GitHub repository:
+Only include the files you need — the action skips any that are missing.
+
+### 2. Add your Supabase access token as a secret
+
+Go to your repo's **Settings > Secrets and variables > Actions** and add:
 
 | Secret | Description |
 |---|---|
 | `SUPABASE_ACCESS_TOKEN` | Personal Access Token from [supabase.com/dashboard/account/tokens](https://supabase.com/dashboard/account/tokens) |
 
-## Workflows
+### 3. Create a workflow
 
-### Inspection (read-only)
+```yaml
+# .github/workflows/apply-supabase-config.yml
+name: Apply Supabase Config
 
-| Workflow | Input | What it does |
-|---|---|---|
-| `list-projects.yml` | — | Lists all projects (name, ref, region, status) |
-| `project-health.yml` | `project_ref` | Shows project details and service health |
-| `inspect-auth-config.yml` | `project_ref` | Dumps full auth config (providers, JWT, MFA) |
-| `inspect-postgrest-config.yml` | `project_ref` | Dumps PostgREST config (schemas, max rows) |
-| `inspect-security.yml` | `project_ref` | Shows SSL, network restrictions, and security/performance advisor recommendations |
-| `list-secrets.yml` | `project_ref` | Lists Edge Function secret names (values are never exposed) |
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.supabase/**'
+  workflow_dispatch:
 
-### GitOps (mutation)
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
 
-These workflows apply desired state from config files in this repo:
-
-| Workflow | Config file | What it applies |
-|---|---|---|
-| `apply-auth-config.yml` | `projects/<name>/auth.json` | Auth settings (providers, JWT expiry, MFA, etc.) |
-| `apply-postgrest-config.yml` | `projects/<name>/postgrest.json` | PostgREST settings (exposed schemas, max rows, etc.) |
-| `apply-network-restrictions.yml` | `projects/<name>/network.json` | Allowed CIDRs for database access |
-| `apply-ssl-enforcement.yml` | `projects/<name>/ssl.json` | SSL enforcement |
-
-Each mutation workflow fetches the current state, shows a diff in the job summary, then applies the patch.
-
-## Repo structure
-
-```
-.github/
-  workflows/          # all workflows
-projects/
-  <project-name>/
-    auth.json
-    postgrest.json
-    network.json
-    ssl.json
-    readme.md         # project notes
+      - uses: yeahwick/supabase-admin@main
+        with:
+          project_ref: abcdefghijklmnop       # your Supabase project ref
+          config_dir: .supabase                # default, can be omitted
+          supabase_token: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
 ```
 
-## Example project
+That's it. Pushing changes to `.supabase/` will automatically apply them to your Supabase project.
 
-`projects/supabase-example/` contains config for a todo app ([YeahWick/supabase-example](https://github.com/YeahWick/supabase-example)) using anonymous auth, PostgREST on the `public` schema, and Row Level Security for per-user isolation.
+## Action inputs
+
+| Input | Required | Default | Description |
+|---|---|---|---|
+| `project_ref` | Yes | — | Supabase project reference ID |
+| `config_dir` | No | `.supabase` | Directory containing config JSON files |
+| `supabase_token` | Yes | — | Supabase Personal Access Token |
+
+## Config file reference
+
+### `auth.json`
+
+Auth settings applied via `PATCH /v1/projects/{ref}/config/auth`. Example:
+
+```json
+{
+  "EXTERNAL_ANONYMOUS_USERS_ENABLED": true,
+  "JWT_EXP": 3600,
+  "MFA_MAX_ENROLLED_FACTORS": 10
+}
+```
+
+### `postgrest.json`
+
+PostgREST settings applied via `PATCH /v1/projects/{ref}/postgrest`. Example:
+
+```json
+{
+  "db_schema": "public",
+  "max_rows": 1000,
+  "db_extra_search_path": "public,extensions"
+}
+```
+
+### `network.json`
+
+Network restrictions applied via `POST /v1/projects/{ref}/network-restrictions/apply`. Example:
+
+```json
+{
+  "dbAllowedCidrs": ["0.0.0.0/0"]
+}
+```
+
+### `ssl.json`
+
+SSL enforcement applied via `PUT /v1/projects/{ref}/ssl-enforcement`. Example:
+
+```json
+{
+  "requestedConfig": {
+    "database": true
+  }
+}
+```
+
+## Multiple environments
+
+Use separate workflows or matrix strategies to target different projects:
+
+```yaml
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - env: staging
+            project_ref: staging-ref-here
+            config_dir: .supabase/staging
+          - env: production
+            project_ref: production-ref-here
+            config_dir: .supabase/production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: yeahwick/supabase-admin@main
+        with:
+          project_ref: ${{ matrix.project_ref }}
+          config_dir: ${{ matrix.config_dir }}
+          supabase_token: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+```
+
+## Using this repo directly
+
+This repo also includes inspection and mutation workflows for centralized management of multiple Supabase projects. See the `.github/workflows/` directory and the `projects/` directory for per-project config examples.

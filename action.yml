@@ -1,0 +1,140 @@
+name: Apply Supabase Config
+description: Applies Supabase project configuration from local JSON files via the Management API
+branding:
+  icon: settings
+  color: green
+
+inputs:
+  project_ref:
+    description: 'Supabase project reference ID'
+    required: true
+  config_dir:
+    description: 'Directory containing config JSON files'
+    required: false
+    default: .supabase
+  supabase_token:
+    description: 'Supabase Personal Access Token (PAT)'
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Apply auth config
+      if: ${{ hashFiles(format('{0}/auth.json', inputs.config_dir)) != '' }}
+      shell: bash
+      env:
+        SUPABASE_ACCESS_TOKEN: ${{ inputs.supabase_token }}
+        PROJECT_REF: ${{ inputs.project_ref }}
+        CONFIG_DIR: ${{ inputs.config_dir }}
+      run: |
+        api="https://api.supabase.com/v1"
+        auth="Authorization: Bearer $SUPABASE_ACCESS_TOKEN"
+
+        result=$(curl -s -w "\n%{http_code}" \
+          -X PATCH \
+          -H "$auth" \
+          -H "Content-Type: application/json" \
+          -d @"${CONFIG_DIR}/auth.json" \
+          "$api/projects/$PROJECT_REF/config/auth")
+
+        code=$(echo "$result" | tail -1)
+        body=$(echo "$result" | sed '$d')
+
+        if [ "$code" -eq 200 ]; then
+          echo "::notice::Auth config applied successfully"
+        else
+          echo "::error::Failed to apply auth config (HTTP $code)"
+          echo "$body"
+          exit 1
+        fi
+
+    - name: Apply postgrest config
+      if: ${{ hashFiles(format('{0}/postgrest.json', inputs.config_dir)) != '' }}
+      shell: bash
+      env:
+        SUPABASE_ACCESS_TOKEN: ${{ inputs.supabase_token }}
+        PROJECT_REF: ${{ inputs.project_ref }}
+        CONFIG_DIR: ${{ inputs.config_dir }}
+      run: |
+        api="https://api.supabase.com/v1"
+        auth="Authorization: Bearer $SUPABASE_ACCESS_TOKEN"
+
+        result=$(curl -s -w "\n%{http_code}" \
+          -X PATCH \
+          -H "$auth" \
+          -H "Content-Type: application/json" \
+          -d @"${CONFIG_DIR}/postgrest.json" \
+          "$api/projects/$PROJECT_REF/postgrest")
+
+        code=$(echo "$result" | tail -1)
+        body=$(echo "$result" | sed '$d')
+
+        if [ "$code" -eq 200 ]; then
+          echo "::notice::PostgREST config applied successfully"
+        else
+          echo "::error::Failed to apply PostgREST config (HTTP $code)"
+          echo "$body"
+          exit 1
+        fi
+
+    - name: Apply network restrictions
+      if: ${{ hashFiles(format('{0}/network.json', inputs.config_dir)) != '' }}
+      shell: bash
+      env:
+        SUPABASE_ACCESS_TOKEN: ${{ inputs.supabase_token }}
+        PROJECT_REF: ${{ inputs.project_ref }}
+        CONFIG_DIR: ${{ inputs.config_dir }}
+      run: |
+        api="https://api.supabase.com/v1"
+        auth="Authorization: Bearer $SUPABASE_ACCESS_TOKEN"
+
+        desired=$(cat "${CONFIG_DIR}/network.json" | jq '{dbAllowedCidrs}')
+
+        result=$(curl -s -w "\n%{http_code}" \
+          -X POST \
+          -H "$auth" \
+          -H "Content-Type: application/json" \
+          -d "$desired" \
+          "$api/projects/$PROJECT_REF/network-restrictions/apply")
+
+        code=$(echo "$result" | tail -1)
+        body=$(echo "$result" | sed '$d')
+
+        if [ "$code" -eq 200 ] || [ "$code" -eq 201 ]; then
+          echo "::notice::Network restrictions applied successfully"
+        else
+          echo "::error::Failed to apply network restrictions (HTTP $code)"
+          echo "$body"
+          exit 1
+        fi
+
+    - name: Apply SSL enforcement
+      if: ${{ hashFiles(format('{0}/ssl.json', inputs.config_dir)) != '' }}
+      shell: bash
+      env:
+        SUPABASE_ACCESS_TOKEN: ${{ inputs.supabase_token }}
+        PROJECT_REF: ${{ inputs.project_ref }}
+        CONFIG_DIR: ${{ inputs.config_dir }}
+      run: |
+        api="https://api.supabase.com/v1"
+        auth="Authorization: Bearer $SUPABASE_ACCESS_TOKEN"
+
+        desired=$(cat "${CONFIG_DIR}/ssl.json" | jq '{requestedConfig}')
+
+        result=$(curl -s -w "\n%{http_code}" \
+          -X PUT \
+          -H "$auth" \
+          -H "Content-Type: application/json" \
+          -d "$desired" \
+          "$api/projects/$PROJECT_REF/ssl-enforcement")
+
+        code=$(echo "$result" | tail -1)
+        body=$(echo "$result" | sed '$d')
+
+        if [ "$code" -eq 200 ]; then
+          echo "::notice::SSL enforcement applied successfully"
+        else
+          echo "::error::Failed to apply SSL enforcement (HTTP $code)"
+          echo "$body"
+          exit 1
+        fi
