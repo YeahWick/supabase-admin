@@ -67,19 +67,51 @@ That's it. Pushing changes to `.supabase/` will automatically apply them to your
 
 ### `auth.json`
 
-Auth settings applied via `PATCH /v1/projects/{ref}/config/auth`. Example:
+Auth settings applied via `PATCH /v1/projects/{ref}/config/auth`. Only include the fields you want to set — omitted fields are left unchanged.
+
+| Field | Type | Description |
+|---|---|---|
+| `anonymous_users_enabled` | boolean | Allow anonymous sign-ins (users without email/password) |
+| `disable_signup` | boolean | When `true`, new user registrations are blocked |
+| `jwt_exp` | number | JWT token expiry time in seconds (e.g. `3600` = 1 hour) |
+| `site_url` | string | The base URL of your app, used for redirect links in auth emails |
+| `external.anonymous.enabled` | boolean | Enable the anonymous auth provider |
+| `external.email.enabled` | boolean | Enable email/password sign-in |
+| `external.email.double_confirm_changes` | boolean | Require confirmation when a user changes their email |
+| `external.email.autoconfirm` | boolean | Skip email verification on signup (not recommended for production) |
+| `mfa.enabled` | boolean | Enable multi-factor authentication |
+
+Example:
 
 ```json
 {
-  "EXTERNAL_ANONYMOUS_USERS_ENABLED": true,
-  "JWT_EXP": 3600,
-  "MFA_MAX_ENROLLED_FACTORS": 10
+  "anonymous_users_enabled": true,
+  "disable_signup": false,
+  "jwt_exp": 3600,
+  "site_url": "http://localhost:3000",
+  "external": {
+    "anonymous": { "enabled": true },
+    "email": {
+      "enabled": true,
+      "double_confirm_changes": true,
+      "autoconfirm": false
+    }
+  },
+  "mfa": { "enabled": false }
 }
 ```
 
 ### `postgrest.json`
 
-PostgREST settings applied via `PATCH /v1/projects/{ref}/postgrest`. Example:
+PostgREST settings applied via `PATCH /v1/projects/{ref}/postgrest`. Controls how the auto-generated REST API behaves.
+
+| Field | Type | Description |
+|---|---|---|
+| `db_schema` | string | Comma-separated list of schemas exposed through the REST API (e.g. `"public"`) |
+| `max_rows` | number | Maximum number of rows returned per request. Limits unbounded queries |
+| `db_extra_search_path` | string | Additional schemas added to the PostgreSQL `search_path` (e.g. `"public,extensions"`) |
+
+Example:
 
 ```json
 {
@@ -91,17 +123,29 @@ PostgREST settings applied via `PATCH /v1/projects/{ref}/postgrest`. Example:
 
 ### `network.json`
 
-Network restrictions applied via `POST /v1/projects/{ref}/network-restrictions/apply`. Example:
+Network restrictions applied via `POST /v1/projects/{ref}/network-restrictions/apply`. Controls which IPs can connect directly to your database.
+
+| Field | Type | Description |
+|---|---|---|
+| `dbAllowedCidrs` | string[] | List of allowed CIDR ranges. An empty array `[]` means **allow all connections**. Add specific CIDRs like `"203.0.113.0/24"` to restrict access |
+
+Example:
 
 ```json
 {
-  "dbAllowedCidrs": ["0.0.0.0/0"]
+  "dbAllowedCidrs": ["203.0.113.0/24", "10.0.0.0/8"]
 }
 ```
 
 ### `ssl.json`
 
-SSL enforcement applied via `PUT /v1/projects/{ref}/ssl-enforcement`. Example:
+SSL enforcement applied via `PUT /v1/projects/{ref}/ssl-enforcement`. Controls whether database connections must use SSL.
+
+| Field | Type | Description |
+|---|---|---|
+| `requestedConfig.database` | boolean | When `true`, all database connections must use SSL. Unencrypted connections are rejected |
+
+Example:
 
 ```json
 {
