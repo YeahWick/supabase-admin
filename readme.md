@@ -155,6 +155,24 @@ Example:
 }
 ```
 
+## Schemas and Row Level Security
+
+The `db_schema` setting in `postgrest.json` controls which PostgreSQL schemas are exposed through the REST API. The `public` schema is the default and is where most tables live.
+
+**`public` schema + RLS** is the standard Supabase pattern for user data. These work at different layers:
+
+- **`db_schema`** controls which tables are *reachable* via the API
+- **RLS policies** control which *rows* a user can access within those tables
+
+Without RLS, any table in an exposed schema is fully readable/writable by anyone with the anon key. Always enable RLS on user-facing tables.
+
+**Private schemas** (e.g. `internal`) are useful for data that should never be accessible via the API — audit logs, elevated-privilege functions, cache tables, or internal config. Since they aren't listed in `db_schema`, PostgREST won't route to them at all, so no RLS is needed as a gatekeeper.
+
+| Schema | Exposed via API | RLS needed | Use for |
+|---|---|---|---|
+| `public` | Yes | Yes | User-facing tables (todos, profiles, etc.) |
+| `internal` / `private` | No | No | Audit logs, admin functions, background jobs |
+
 ## Multiple environments
 
 Use separate workflows or matrix strategies to target different projects:
