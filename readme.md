@@ -1,61 +1,204 @@
 # supabase-admin
 
-Infrastructure as Code for managing Supabase projects via GitHub Actions workflows. No CLI or SDK required — just `curl` + `jq` against the [Supabase Management API](https://api.supabase.com/v1).
+A reusable GitHub Action for managing Supabase project configuration as code. Drop it into any repo to apply auth, PostgREST, network, and SSL settings via the [Supabase Management API](https://api.supabase.com/v1) — no CLI or SDK required.
 
-## How it works
+## Quick start
 
-All workflows authenticate with a Supabase Personal Access Token (PAT) stored as a GitHub Actions secret. Workflows are `workflow_dispatch` so they can be triggered manually from the Actions tab.
+### 1. Add config files to your repo
 
-Per-project configuration lives under `projects/<project-name>/`. Mutation workflows read desired state from those files and apply it to the target project via the API.
+Create a `.supabase/` directory (or any directory you prefer) with the configs you want to manage:
 
-## Setup
+```
+your-repo/
+  .supabase/
+    auth.json          # Auth settings (providers, JWT expiry, MFA, etc.)
+    postgrest.json     # PostgREST settings (exposed schemas, max rows, etc.)
+    network.json       # Allowed CIDRs for database access
+    ssl.json           # SSL enforcement settings
+```
 
-Add the following secret to your GitHub repository:
+Only include the files you need — the action skips any that are missing.
+
+### 2. Add your Supabase access token as a secret
+
+Go to your repo's **Settings > Secrets and variables > Actions** and add:
 
 | Secret | Description |
 |---|---|
 | `SUPABASE_ACCESS_TOKEN` | Personal Access Token from [supabase.com/dashboard/account/tokens](https://supabase.com/dashboard/account/tokens) |
 
-## Workflows
+### 3. Create a workflow
 
-### Inspection (read-only)
+```yaml
+# .github/workflows/apply-supabase-config.yml
+name: Apply Supabase Config
 
-| Workflow | Input | What it does |
-|---|---|---|
-| `list-projects.yml` | — | Lists all projects (name, ref, region, status) |
-| `project-health.yml` | `project_ref` | Shows project details and service health |
-| `inspect-auth-config.yml` | `project_ref` | Dumps full auth config (providers, JWT, MFA) |
-| `inspect-postgrest-config.yml` | `project_ref` | Dumps PostgREST config (schemas, max rows) |
-| `inspect-security.yml` | `project_ref` | Shows SSL, network restrictions, and security/performance advisor recommendations |
-| `list-secrets.yml` | `project_ref` | Lists Edge Function secret names (values are never exposed) |
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.supabase/**'
+  workflow_dispatch:
 
-### GitOps (mutation)
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
 
-These workflows apply desired state from config files in this repo:
-
-| Workflow | Config file | What it applies |
-|---|---|---|
-| `apply-auth-config.yml` | `projects/<name>/auth.json` | Auth settings (providers, JWT expiry, MFA, etc.) |
-| `apply-postgrest-config.yml` | `projects/<name>/postgrest.json` | PostgREST settings (exposed schemas, max rows, etc.) |
-| `apply-network-restrictions.yml` | `projects/<name>/network.json` | Allowed CIDRs for database access |
-| `apply-ssl-enforcement.yml` | `projects/<name>/ssl.json` | SSL enforcement |
-
-Each mutation workflow fetches the current state, shows a diff in the job summary, then applies the patch.
-
-## Repo structure
-
-```
-.github/
-  workflows/          # all workflows
-projects/
-  <project-name>/
-    auth.json
-    postgrest.json
-    network.json
-    ssl.json
-    readme.md         # project notes
+      - uses: yeahwick/supabase-admin@main
+        with:
+          project_ref: abcdefghijklmnop       # your Supabase project ref
+          config_dir: .supabase                # default, can be omitted
+          supabase_token: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
 ```
 
-## Example project
+That's it. Pushing changes to `.supabase/` will automatically apply them to your Supabase project.
 
-`projects/supabase-example/` contains config for a todo app ([YeahWick/supabase-example](https://github.com/YeahWick/supabase-example)) using anonymous auth, PostgREST on the `public` schema, and Row Level Security for per-user isolation.
+## Action inputs
+
+| Input | Required | Default | Description |
+|---|---|---|---|
+| `project_ref` | Yes | — | Supabase project reference ID |
+| `config_dir` | No | `.supabase` | Directory containing config JSON files |
+| `supabase_token` | Yes | — | Supabase Personal Access Token |
+
+## Config file reference
+
+### `auth.json`
+
+Auth settings applied via `PATCH /v1/projects/{ref}/config/auth`. Only include the fields you want to set — omitted fields are left unchanged.
+
+| Field | Type | Description |
+|---|---|---|
+| `anonymous_users_enabled` | boolean | Allow anonymous sign-ins (users without email/password) |
+| `disable_signup` | boolean | When `true`, new user registrations are blocked |
+| `jwt_exp` | number | JWT token expiry time in seconds (e.g. `3600` = 1 hour) |
+| `site_url` | string | The base URL of your app, used for redirect links in auth emails |
+| `external.anonymous.enabled` | boolean | Enable the anonymous auth provider |
+| `external.email.enabled` | boolean | Enable email/password sign-in |
+| `external.email.double_confirm_changes` | boolean | Require confirmation when a user changes their email |
+| `external.email.autoconfirm` | boolean | Skip email verification on signup (not recommended for production) |
+| `mfa.enabled` | boolean | Enable multi-factor authentication |
+
+Example:
+
+```json
+{
+  "anonymous_users_enabled": true,
+  "disable_signup": false,
+  "jwt_exp": 3600,
+  "site_url": "http://localhost:3000",
+  "external": {
+    "anonymous": { "enabled": true },
+    "email": {
+      "enabled": true,
+      "double_confirm_changes": true,
+      "autoconfirm": false
+    }
+  },
+  "mfa": { "enabled": false }
+}
+```
+
+### `postgrest.json`
+
+PostgREST settings applied via `PATCH /v1/projects/{ref}/postgrest`. Controls how the auto-generated REST API behaves.
+
+| Field | Type | Description |
+|---|---|---|
+| `db_schema` | string | Comma-separated list of schemas exposed through the REST API (e.g. `"public"`) |
+| `max_rows` | number | Maximum number of rows returned per request. Limits unbounded queries |
+| `db_extra_search_path` | string | Additional schemas added to the PostgreSQL `search_path` (e.g. `"public,extensions"`) |
+
+Example:
+
+```json
+{
+  "db_schema": "public",
+  "max_rows": 1000,
+  "db_extra_search_path": "public,extensions"
+}
+```
+
+### `network.json`
+
+Network restrictions applied via `POST /v1/projects/{ref}/network-restrictions/apply`. Controls which IPs can connect directly to your database.
+
+| Field | Type | Description |
+|---|---|---|
+| `dbAllowedCidrs` | string[] | List of allowed CIDR ranges. An empty array `[]` means **allow all connections**. Add specific CIDRs like `"203.0.113.0/24"` to restrict access |
+
+Example:
+
+```json
+{
+  "dbAllowedCidrs": ["203.0.113.0/24", "10.0.0.0/8"]
+}
+```
+
+### `ssl.json`
+
+SSL enforcement applied via `PUT /v1/projects/{ref}/ssl-enforcement`. Controls whether database connections must use SSL.
+
+| Field | Type | Description |
+|---|---|---|
+| `requestedConfig.database` | boolean | When `true`, all database connections must use SSL. Unencrypted connections are rejected |
+
+Example:
+
+```json
+{
+  "requestedConfig": {
+    "database": true
+  }
+}
+```
+
+## Schemas and Row Level Security
+
+The `db_schema` setting in `postgrest.json` controls which PostgreSQL schemas are exposed through the REST API. The `public` schema is the default and is where most tables live.
+
+**`public` schema + RLS** is the standard Supabase pattern for user data. These work at different layers:
+
+- **`db_schema`** controls which tables are *reachable* via the API
+- **RLS policies** control which *rows* a user can access within those tables
+
+Without RLS, any table in an exposed schema is fully readable/writable by anyone with the anon key. Always enable RLS on user-facing tables.
+
+**Private schemas** (e.g. `internal`) are useful for data that should never be accessible via the API — audit logs, elevated-privilege functions, cache tables, or internal config. Since they aren't listed in `db_schema`, PostgREST won't route to them at all, so no RLS is needed as a gatekeeper.
+
+| Schema | Exposed via API | RLS needed | Use for |
+|---|---|---|---|
+| `public` | Yes | Yes | User-facing tables (todos, profiles, etc.) |
+| `internal` / `private` | No | No | Audit logs, admin functions, background jobs |
+
+## Multiple environments
+
+Use separate workflows or matrix strategies to target different projects:
+
+```yaml
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - env: staging
+            project_ref: staging-ref-here
+            config_dir: .supabase/staging
+          - env: production
+            project_ref: production-ref-here
+            config_dir: .supabase/production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: yeahwick/supabase-admin@main
+        with:
+          project_ref: ${{ matrix.project_ref }}
+          config_dir: ${{ matrix.config_dir }}
+          supabase_token: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+```
+
+## Using this repo directly
+
+This repo also includes inspection and mutation workflows for centralized management of multiple Supabase projects. See the `.github/workflows/` directory and the `projects/` directory for per-project config examples.
