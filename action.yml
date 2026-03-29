@@ -504,6 +504,11 @@ runs:
         fi
 
     # ── Step 10: Push secrets ────────────────────────────────────────────
+    # TODO: secrets_file requires a runtime-generated file because GitHub Actions
+    # does not interpolate ${{ secrets.X }} expressions inside checked-in files.
+    # A future `secrets` inline input (JSON string in the `with:` block) would
+    # let expressions be evaluated directly. For now, callers must generate the
+    # secrets file in a prior step before pointing secrets_file at it.
     - name: Push secrets
       if: ${{ inputs.secrets_file != '' && hashFiles(inputs.secrets_file) != '' }}
       shell: bash

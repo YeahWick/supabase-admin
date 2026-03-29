@@ -300,16 +300,25 @@ Example:
 
 Secrets pushed via `POST /v1/projects/{ref}/secrets`. These are available as environment variables in Edge Functions and in Postgres Vault.
 
-The file is a simple key-value JSON object. In your workflow, use GitHub secrets as values so raw secrets never appear in source code:
+The file is a simple key-value JSON object with placeholder values. Because GitHub Actions does **not** interpolate `${{ secrets.X }}` expressions inside checked-in files, you must generate the secrets file at runtime in a prior step and point `secrets_file` at the generated path:
 
-```json
-{
-  "STRIPE_SECRET_KEY": "${{ secrets.STRIPE_KEY }}",
-  "RESEND_API_KEY": "${{ secrets.RESEND_KEY }}"
-}
+```yaml
+- name: Generate secrets file
+  run: |
+    cat > /tmp/secrets.json <<EOF
+    {
+      "STRIPE_SECRET_KEY": "${{ secrets.STRIPE_KEY }}",
+      "RESEND_API_KEY": "${{ secrets.RESEND_KEY }}"
+    }
+    EOF
+
+- uses: yeahwick/supabase-admin@main
+  with:
+    secrets_file: /tmp/secrets.json
+    supabase_token: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
 ```
 
-> **Note:** Since GitHub Actions doesn't interpolate expressions inside checked-in files, use a workflow step to generate `secrets.json` at runtime, or point `secrets_file` to a file created by a prior step.
+> **TODO:** A future `secrets` inline input will accept a JSON string directly in the `with:` block (where expressions are evaluated), removing the need for the extra generation step.
 
 ## SQL migrations
 
