@@ -1,0 +1,7 @@
+{
+  "db_slot": "supabase_realtime_rls",
+  "max_events_per_second": 100,
+  "max_joins_per_second": 100,
+  "max_channels_per_client": 100,
+  "max_bytes_per_second": 100000
+}

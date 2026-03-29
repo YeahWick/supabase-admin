@@ -1,0 +1,8 @@
+{
+  "fileSizeLimit": 52428800,
+  "features": {
+    "imageTransformation": {
+      "enabled": true
+    }
+  }
+}
