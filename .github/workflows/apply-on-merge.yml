@@ -1,0 +1,89 @@
+name: Apply on Merge
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'projects/**'
+  workflow_dispatch:
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.find-projects.outputs.matrix }}
+      has_projects: ${{ steps.find-projects.outputs.has_projects }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Find changed project directories
+        id: find-projects
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            changed=$(git diff --name-only HEAD~1 HEAD -- 'projects/')
+            dirs=$(echo "$changed" | grep -oP '^projects/[^/]+' | sort -u)
+          else
+            # workflow_dispatch: apply all projects
+            dirs=$(find projects -maxdepth 1 -mindepth 1 -type d 2>/dev/null)
+          fi
+
+          matrix_entries=""
+          count=0
+
+          while IFS= read -r dir; do
+            [ -z "$dir" ] && continue
+            project_json="$dir/project.json"
+            [ -f "$project_json" ] || continue
+
+            project_ref=$(jq -r '.project_ref' "$project_json")
+            project_name=$(jq -r '.project_name // ""' "$project_json")
+            env_name=$(jq -r '.environment // "unknown"' "$project_json")
+
+            [ -z "$project_ref" ] && continue
+
+            entry=$(jq -n \
+              --arg dir "$dir" \
+              --arg ref "$project_ref" \
+              --arg name "$project_name" \
+              --arg env "$env_name" \
+              '{"dir": $dir, "project_ref": $ref, "project_name": $name, "environment": $env}')
+
+            if [ -n "$matrix_entries" ]; then
+              matrix_entries="${matrix_entries},${entry}"
+            else
+              matrix_entries="$entry"
+            fi
+            count=$((count + 1))
+          done <<< "$dirs"
+
+          echo "matrix={\"include\":[${matrix_entries}]}" >> "$GITHUB_OUTPUT"
+
+          if [ "$count" -gt 0 ]; then
+            echo "has_projects=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_projects=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  apply:
+    needs: discover
+    if: needs.discover.outputs.has_projects == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJson(needs.discover.outputs.matrix) }}
+      fail-fast: false
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Apply config
+        uses: ./
+        with:
+          mode: apply
+          project_ref: ${{ matrix.project_ref }}
+          config_dir: ${{ matrix.dir }}
+          schema_dir: ${{ matrix.dir }}/migrations
+          functions_dir: ${{ matrix.dir }}/functions
+          supabase_token: ${{ secrets.SUPABASE_ACCESS_TOKEN }}

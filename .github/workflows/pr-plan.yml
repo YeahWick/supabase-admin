@@ -1,0 +1,270 @@
+name: Plan Supabase Changes
+
+on:
+  pull_request:
+    paths:
+      - 'projects/**'
+    types: [opened, synchronize, reopened]
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.find-projects.outputs.matrix }}
+      has_projects: ${{ steps.find-projects.outputs.has_projects }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Find changed project directories
+        id: find-projects
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          changed=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- 'projects/')
+          dirs=$(echo "$changed" | grep -oP '^projects/[^/]+' | sort -u)
+
+          matrix_entries=""
+          count=0
+
+          while IFS= read -r dir; do
+            [ -z "$dir" ] && continue
+            project_json="$dir/project.json"
+
+            if [ ! -f "$project_json" ]; then
+              echo "::warning::$dir has changed files but no project.json, skipping"
+              continue
+            fi
+
+            project_ref=$(jq -r '.project_ref' "$project_json")
+            project_name=$(jq -r '.project_name // ""' "$project_json")
+            env_name=$(jq -r '.environment // "unknown"' "$project_json")
+
+            if [ -z "$project_ref" ]; then
+              echo "::warning::$dir/project.json has no project_ref, skipping"
+              continue
+            fi
+
+            entry=$(jq -n \
+              --arg dir "$dir" \
+              --arg ref "$project_ref" \
+              --arg name "$project_name" \
+              --arg env "$env_name" \
+              '{"dir": $dir, "project_ref": $ref, "project_name": $name, "environment": $env}')
+
+            if [ -n "$matrix_entries" ]; then
+              matrix_entries="${matrix_entries},${entry}"
+            else
+              matrix_entries="$entry"
+            fi
+            count=$((count + 1))
+          done <<< "$dirs"
+
+          echo "matrix={\"include\":[${matrix_entries}]}" >> "$GITHUB_OUTPUT"
+
+          if [ "$count" -gt 0 ]; then
+            echo "has_projects=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_projects=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  plan:
+    needs: discover
+    if: needs.discover.outputs.has_projects == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJson(needs.discover.outputs.matrix) }}
+      fail-fast: false
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run plan
+        id: plan
+        uses: ./
+        with:
+          mode: plan
+          project_ref: ${{ matrix.project_ref }}
+          config_dir: ${{ matrix.dir }}
+          schema_dir: ${{ matrix.dir }}/migrations
+          functions_dir: ${{ matrix.dir }}/functions
+          plan_output_file: /tmp/plan.json
+          supabase_token: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+
+      - name: Build comment markdown
+        id: build-comment
+        env:
+          PLAN_FILE: /tmp/plan.json
+          PROJECT_NAME: ${{ matrix.project_name }}
+          ENVIRONMENT: ${{ matrix.environment }}
+          PROJECT_REF: ${{ matrix.project_ref }}
+          PR_SHA: ${{ github.event.pull_request.head.sha }}
+          HAS_CHANGES: ${{ steps.plan.outputs.has_changes }}
+        run: |
+          short_sha="${PR_SHA:0:7}"
+          comment="<!-- supa-plan:${PROJECT_REF} -->"$'\n'
+
+          if [ -n "$PROJECT_NAME" ]; then
+            header="$PROJECT_NAME"
+          else
+            header="$PROJECT_REF"
+          fi
+          if [ "$ENVIRONMENT" != "unknown" ] && [ -n "$ENVIRONMENT" ]; then
+            header="$header ($ENVIRONMENT)"
+          fi
+
+          comment+="## Supabase Plan: ${header}"$'\n'
+          comment+="> Planned for commit \`${short_sha}\`"$'\n\n'
+
+          if [ "$HAS_CHANGES" != "true" ]; then
+            comment+="Everything is up to date. No changes will be applied on merge."$'\n'
+          else
+            plan=$(cat "$PLAN_FILE")
+
+            # Config sections with table diffs
+            for section in auth postgrest realtime storage-config; do
+              nice_name=""
+              key="$section"
+              case "$section" in
+                auth) nice_name="Auth Config" ;;
+                postgrest) nice_name="PostgREST Config" ;;
+                realtime) nice_name="Realtime Config" ;;
+                storage-config) nice_name="Storage Config"; key="storage-config" ;;
+              esac
+
+              status=$(echo "$plan" | jq -r ".changes.\"$key\".status // \"absent\"")
+
+              if [ "$status" = "no-change" ]; then
+                comment+="### ${nice_name} — no changes"$'\n\n'
+              elif [ "$status" = "changed" ]; then
+                comment+="### ${nice_name} — :warning: changes detected"$'\n'
+                comment+="| Key | Current | Desired |"$'\n'
+                comment+="|-----|---------|---------|"$'\n'
+
+                for k in $(echo "$plan" | jq -r ".changes.\"$key\".diff | keys[]"); do
+                  current=$(echo "$plan" | jq -c ".changes.\"$key\".diff.\"$k\".current")
+                  desired=$(echo "$plan" | jq -c ".changes.\"$key\".diff.\"$k\".desired")
+                  comment+="| \`$k\` | \`$current\` | \`$desired\` |"$'\n'
+                done
+                comment+=$'\n'
+              fi
+            done
+
+            # Network restrictions
+            net_status=$(echo "$plan" | jq -r '.changes.network.status // "absent"')
+            if [ "$net_status" = "no-change" ]; then
+              comment+="### Network Restrictions — no changes"$'\n\n'
+            elif [ "$net_status" = "changed" ]; then
+              comment+="### Network Restrictions — :warning: changes detected"$'\n'
+              comment+="| Key | Current | Desired |"$'\n'
+              comment+="|-----|---------|---------|"$'\n'
+              current=$(echo "$plan" | jq -c '.changes.network.diff.dbAllowedCidrs.current')
+              desired=$(echo "$plan" | jq -c '.changes.network.diff.dbAllowedCidrs.desired')
+              comment+="| \`dbAllowedCidrs\` | \`$current\` | \`$desired\` |"$'\n\n'
+            fi
+
+            # SSL enforcement
+            ssl_status=$(echo "$plan" | jq -r '.changes.ssl.status // "absent"')
+            if [ "$ssl_status" = "no-change" ]; then
+              comment+="### SSL Enforcement — no changes"$'\n\n'
+            elif [ "$ssl_status" = "changed" ]; then
+              comment+="### SSL Enforcement — :warning: changes detected"$'\n'
+              current=$(echo "$plan" | jq -c '.changes.ssl.diff.requestedConfig.current')
+              desired=$(echo "$plan" | jq -c '.changes.ssl.diff.requestedConfig.desired')
+              comment+="| Key | Current | Desired |"$'\n'
+              comment+="|-----|---------|---------|"$'\n'
+              comment+="| \`requestedConfig\` | \`$current\` | \`$desired\` |"$'\n\n'
+            fi
+
+            # Storage buckets
+            buckets_status=$(echo "$plan" | jq -r '.changes."storage-buckets".status // "absent"')
+            if [ "$buckets_status" = "no-change" ]; then
+              comment+="### Storage Buckets — no changes"$'\n\n'
+            elif [ "$buckets_status" = "changed" ]; then
+              comment+="### Storage Buckets — :warning: changes detected"$'\n'
+              comment+="| Bucket | Action | Details |"$'\n'
+              comment+="|--------|--------|---------|"$'\n'
+
+              for row in $(echo "$plan" | jq -c '.changes."storage-buckets".buckets[]'); do
+                bname=$(echo "$row" | jq -r '.name')
+                baction=$(echo "$row" | jq -r '.action')
+                if [ "$baction" = "create" ]; then
+                  comment+="| \`$bname\` | **create** | — |"$'\n'
+                else
+                  changes=$(echo "$row" | jq -c '.changes // {}' | sed 's/"/`/g')
+                  comment+="| \`$bname\` | update | $changes |"$'\n'
+                fi
+              done
+              comment+=$'\n'
+            fi
+
+            # SQL migrations
+            mig_status=$(echo "$plan" | jq -r '.changes.migrations.status // "absent"')
+            if [ "$mig_status" = "no-change" ]; then
+              comment+="### SQL Migrations — no pending"$'\n\n'
+            elif [ "$mig_status" = "pending" ]; then
+              count=$(echo "$plan" | jq '.changes.migrations.pending | length')
+              comment+="### SQL Migrations — :warning: ${count} pending"$'\n'
+              for m in $(echo "$plan" | jq -r '.changes.migrations.pending[]'); do
+                comment+="- \`$m\`"$'\n'
+              done
+              comment+=$'\n'
+            fi
+
+            # Edge functions
+            func_status=$(echo "$plan" | jq -r '.changes.functions.status // "absent"')
+            if [ "$func_status" = "no-change" ]; then
+              comment+="### Edge Functions — no changes"$'\n\n'
+            elif [ "$func_status" = "changed" ]; then
+              comment+="### Edge Functions — :warning: changes detected"$'\n'
+              comment+="| Function | Action |"$'\n'
+              comment+="|----------|--------|"$'\n'
+              for row in $(echo "$plan" | jq -c '.changes.functions.functions[]'); do
+                fname=$(echo "$row" | jq -r '.name')
+                faction=$(echo "$row" | jq -r '.action')
+                if [ "$faction" = "create" ]; then
+                  comment+="| \`$fname\` | **create** |"$'\n'
+                else
+                  comment+="| \`$fname\` | update |"$'\n'
+                fi
+              done
+              comment+=$'\n'
+            fi
+
+            # Secrets
+            sec_status=$(echo "$plan" | jq -r '.changes.secrets.status // "absent"')
+            if [ "$sec_status" = "present" ]; then
+              sec_count=$(echo "$plan" | jq -r '.changes.secrets.key_count')
+              comment+="### Secrets — ${sec_count} key(s) present"$'\n'
+              comment+="> Secret values are not diffed. Apply to sync."$'\n\n'
+            fi
+
+            comment+="---"$'\n'
+            comment+="Comment \`/supa-apply\` to apply these changes."$'\n'
+          fi
+
+          # Write to output using delimiter
+          delimiter="EOF_$(date +%s%N)"
+          echo "comment_body<<$delimiter" >> "$GITHUB_OUTPUT"
+          echo "$comment" >> "$GITHUB_OUTPUT"
+          echo "$delimiter" >> "$GITHUB_OUTPUT"
+
+      - name: Find existing bot comment
+        id: find-comment
+        uses: peter-evans/find-comment@v3
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          comment-author: 'github-actions[bot]'
+          body-includes: '<!-- supa-plan:${{ matrix.project_ref }} -->'
+
+      - name: Create or update PR comment
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          comment-id: ${{ steps.find-comment.outputs.comment-id }}
+          issue-number: ${{ github.event.pull_request.number }}
+          body: ${{ steps.build-comment.outputs.comment_body }}
+          edit-mode: replace
