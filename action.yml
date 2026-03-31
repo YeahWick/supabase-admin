@@ -1,30 +1,168 @@
 name: Apply Supabase Config
-description: Applies Supabase project configuration from local JSON files via the Management API
+description: Applies Supabase project configuration from local JSON files via the Management API. Supports project creation, config management, SQL migrations, storage buckets, secrets, and edge function deployment.
 branding:
   icon: settings
   color: green
 
 inputs:
+  mode:
+    description: 'Action mode: "apply" (default) to configure an existing project, or "create" to provision a new project first'
+    required: false
+    default: apply
   project_ref:
-    description: 'Supabase project reference ID'
-    required: true
+    description: 'Supabase project reference ID (not required when mode is "create")'
+    required: false
+  organization_id:
+    description: 'Supabase organization ID (required when mode is "create")'
+    required: false
+  project_name:
+    description: 'Name for the new project (required when mode is "create")'
+    required: false
+  region:
+    description: 'Region for the new project (e.g. us-east-1). Only used when mode is "create"'
+    required: false
+    default: us-east-1
+  db_password:
+    description: 'Database password for the new project (required when mode is "create")'
+    required: false
   config_dir:
     description: 'Directory containing config JSON files'
     required: false
     default: .supabase
+  schema_dir:
+    description: 'Directory containing .sql migration files to apply in sorted order'
+    required: false
+  secrets_file:
+    description: 'Path to JSON file containing secrets to push to the project'
+    required: false
+  functions_dir:
+    description: 'Directory containing edge function subdirectories to deploy'
+    required: false
   supabase_token:
     description: 'Supabase Personal Access Token (PAT)'
     required: true
 
+outputs:
+  project_ref:
+    description: 'Supabase project reference ID'
+    value: ${{ steps.resolve-ref.outputs.project_ref }}
+  project_url:
+    description: 'Project API URL (https://<ref>.supabase.co)'
+    value: ${{ steps.fetch-outputs.outputs.project_url }}
+  anon_key:
+    description: 'Public anon API key'
+    value: ${{ steps.fetch-outputs.outputs.anon_key }}
+  service_role_key:
+    description: 'Service role API key'
+    value: ${{ steps.fetch-outputs.outputs.service_role_key }}
+
 runs:
   using: composite
   steps:
+
+    # ── Step 0: Create project (if mode is "create") ─────────────────────
+    - name: Create Supabase project
+      id: create-project
+      if: ${{ inputs.mode == 'create' }}
+      shell: bash
+      env:
+        SUPABASE_ACCESS_TOKEN: ${{ inputs.supabase_token }}
+        ORG_ID: ${{ inputs.organization_id }}
+        PROJECT_NAME: ${{ inputs.project_name }}
+        REGION: ${{ inputs.region }}
+        DB_PASSWORD: ${{ inputs.db_password }}
+      run: |
+        api="https://api.supabase.com/v1"
+        auth="Authorization: Bearer $SUPABASE_ACCESS_TOKEN"
+
+        if [ -z "$ORG_ID" ] || [ -z "$PROJECT_NAME" ] || [ -z "$DB_PASSWORD" ]; then
+          echo "::error::mode 'create' requires organization_id, project_name, and db_password inputs"
+          exit 1
+        fi
+
+        payload=$(jq -n \
+          --arg name "$PROJECT_NAME" \
+          --arg org "$ORG_ID" \
+          --arg region "$REGION" \
+          --arg pass "$DB_PASSWORD" \
+          '{name: $name, organization_id: $org, region: $region, db_pass: $pass}')
+
+        result=$(curl -s -w "\n%{http_code}" \
+          -X POST \
+          -H "$auth" \
+          -H "Content-Type: application/json" \
+          -d "$payload" \
+          "$api/projects")
+
+        code=$(echo "$result" | tail -1)
+        body=$(echo "$result" | sed '$d')
+
+        if [ "$code" -ne 201 ] && [ "$code" -ne 200 ]; then
+          echo "::error::Failed to create project (HTTP $code)"
+          echo "$body"
+          exit 1
+        fi
+
+        ref=$(echo "$body" | jq -r '.id')
+        echo "::notice::Project created with ref: $ref"
+        echo "project_ref=$ref" >> "$GITHUB_OUTPUT"
+
+        # Poll health until all services are ACTIVE_HEALTHY (timeout 10 min)
+        echo "Waiting for project to become healthy..."
+        deadline=$((SECONDS + 600))
+        while [ $SECONDS -lt $deadline ]; do
+          health=$(curl -s \
+            -H "$auth" \
+            "$api/projects/$ref/health")
+
+          all_healthy=true
+          for status in $(echo "$health" | jq -r '.[].status'); do
+            if [ "$status" != "ACTIVE_HEALTHY" ]; then
+              all_healthy=false
+              break
+            fi
+          done
+
+          if [ "$all_healthy" = true ] && [ "$(echo "$health" | jq length)" -gt 0 ]; then
+            echo "::notice::All services are healthy"
+            break
+          fi
+
+          echo "  Services not yet healthy, waiting 10s..."
+          sleep 10
+        done
+
+        if [ "$all_healthy" != true ]; then
+          echo "::warning::Project created but some services may not be healthy yet"
+        fi
+
+    # ── Step 1: Resolve effective project_ref ────────────────────────────
+    - name: Resolve project ref
+      id: resolve-ref
+      shell: bash
+      env:
+        INPUT_REF: ${{ inputs.project_ref }}
+        CREATED_REF: ${{ steps.create-project.outputs.project_ref }}
+        MODE: ${{ inputs.mode }}
+      run: |
+        if [ "$MODE" = "create" ] && [ -n "$CREATED_REF" ]; then
+          ref="$CREATED_REF"
+        elif [ -n "$INPUT_REF" ]; then
+          ref="$INPUT_REF"
+        else
+          echo "::error::project_ref is required when mode is 'apply'"
+          exit 1
+        fi
+        echo "project_ref=$ref" >> "$GITHUB_OUTPUT"
+        echo "::notice::Using project ref: $ref"
+
+    # ── Step 2: Apply auth config ────────────────────────────────────────
     - name: Apply auth config
       if: ${{ hashFiles(format('{0}/auth.json', inputs.config_dir)) != '' }}
       shell: bash
       env:
         SUPABASE_ACCESS_TOKEN: ${{ inputs.supabase_token }}
-        PROJECT_REF: ${{ inputs.project_ref }}
+        PROJECT_REF: ${{ steps.resolve-ref.outputs.project_ref }}
         CONFIG_DIR: ${{ inputs.config_dir }}
       run: |
         api="https://api.supabase.com/v1"
@@ -48,12 +186,13 @@ runs:
           exit 1
         fi
 
+    # ── Step 3: Apply postgrest config ───────────────────────────────────
     - name: Apply postgrest config
       if: ${{ hashFiles(format('{0}/postgrest.json', inputs.config_dir)) != '' }}
       shell: bash
       env:
         SUPABASE_ACCESS_TOKEN: ${{ inputs.supabase_token }}
-        PROJECT_REF: ${{ inputs.project_ref }}
+        PROJECT_REF: ${{ steps.resolve-ref.outputs.project_ref }}
         CONFIG_DIR: ${{ inputs.config_dir }}
       run: |
         api="https://api.supabase.com/v1"
@@ -77,12 +216,13 @@ runs:
           exit 1
         fi
 
+    # ── Step 4: Apply network restrictions ───────────────────────────────
     - name: Apply network restrictions
       if: ${{ hashFiles(format('{0}/network.json', inputs.config_dir)) != '' }}
       shell: bash
       env:
         SUPABASE_ACCESS_TOKEN: ${{ inputs.supabase_token }}
-        PROJECT_REF: ${{ inputs.project_ref }}
+        PROJECT_REF: ${{ steps.resolve-ref.outputs.project_ref }}
         CONFIG_DIR: ${{ inputs.config_dir }}
       run: |
         api="https://api.supabase.com/v1"
@@ -108,12 +248,13 @@ runs:
           exit 1
         fi
 
+    # ── Step 5: Apply SSL enforcement ────────────────────────────────────
     - name: Apply SSL enforcement
       if: ${{ hashFiles(format('{0}/ssl.json', inputs.config_dir)) != '' }}
       shell: bash
       env:
         SUPABASE_ACCESS_TOKEN: ${{ inputs.supabase_token }}
-        PROJECT_REF: ${{ inputs.project_ref }}
+        PROJECT_REF: ${{ steps.resolve-ref.outputs.project_ref }}
         CONFIG_DIR: ${{ inputs.config_dir }}
       run: |
         api="https://api.supabase.com/v1"
@@ -138,3 +279,371 @@ runs:
           echo "$body"
           exit 1
         fi
+
+    # ── Step 6: Apply realtime config ────────────────────────────────────
+    - name: Apply realtime config
+      if: ${{ hashFiles(format('{0}/realtime.json', inputs.config_dir)) != '' }}
+      shell: bash
+      env:
+        SUPABASE_ACCESS_TOKEN: ${{ inputs.supabase_token }}
+        PROJECT_REF: ${{ steps.resolve-ref.outputs.project_ref }}
+        CONFIG_DIR: ${{ inputs.config_dir }}
+      run: |
+        api="https://api.supabase.com/v1"
+        auth="Authorization: Bearer $SUPABASE_ACCESS_TOKEN"
+
+        result=$(curl -s -w "\n%{http_code}" \
+          -X PATCH \
+          -H "$auth" \
+          -H "Content-Type: application/json" \
+          -d @"${CONFIG_DIR}/realtime.json" \
+          "$api/projects/$PROJECT_REF/config/realtime")
+
+        code=$(echo "$result" | tail -1)
+        body=$(echo "$result" | sed '$d')
+
+        if [ "$code" -eq 200 ]; then
+          echo "::notice::Realtime config applied successfully"
+        else
+          echo "::error::Failed to apply realtime config (HTTP $code)"
+          echo "$body"
+          exit 1
+        fi
+
+    # ── Step 7: Apply storage config ─────────────────────────────────────
+    - name: Apply storage config
+      if: ${{ hashFiles(format('{0}/storage-config.json', inputs.config_dir)) != '' }}
+      shell: bash
+      env:
+        SUPABASE_ACCESS_TOKEN: ${{ inputs.supabase_token }}
+        PROJECT_REF: ${{ steps.resolve-ref.outputs.project_ref }}
+        CONFIG_DIR: ${{ inputs.config_dir }}
+      run: |
+        api="https://api.supabase.com/v1"
+        auth="Authorization: Bearer $SUPABASE_ACCESS_TOKEN"
+
+        result=$(curl -s -w "\n%{http_code}" \
+          -X PATCH \
+          -H "$auth" \
+          -H "Content-Type: application/json" \
+          -d @"${CONFIG_DIR}/storage-config.json" \
+          "$api/projects/$PROJECT_REF/config/storage")
+
+        code=$(echo "$result" | tail -1)
+        body=$(echo "$result" | sed '$d')
+
+        if [ "$code" -eq 200 ]; then
+          echo "::notice::Storage config applied successfully"
+        else
+          echo "::error::Failed to apply storage config (HTTP $code)"
+          echo "$body"
+          exit 1
+        fi
+
+    # ── Step 8: Run SQL migrations ───────────────────────────────────────
+    - name: Run SQL migrations
+      if: ${{ inputs.schema_dir != '' && hashFiles(format('{0}/*.sql', inputs.schema_dir)) != '' }}
+      shell: bash
+      env:
+        SUPABASE_ACCESS_TOKEN: ${{ inputs.supabase_token }}
+        PROJECT_REF: ${{ steps.resolve-ref.outputs.project_ref }}
+        SCHEMA_DIR: ${{ inputs.schema_dir }}
+      run: |
+        api="https://api.supabase.com/v1"
+        auth="Authorization: Bearer $SUPABASE_ACCESS_TOKEN"
+
+        # Ensure migrations tracking table exists
+        init_sql="CREATE TABLE IF NOT EXISTS public._supabase_admin_migrations (
+          name TEXT PRIMARY KEY,
+          applied_at TIMESTAMPTZ DEFAULT now()
+        );"
+
+        curl -s -w "\n%{http_code}" \
+          -X POST \
+          -H "$auth" \
+          -H "Content-Type: application/json" \
+          -d "$(jq -n --arg q "$init_sql" '{query: $q}')" \
+          "$api/projects/$PROJECT_REF/database/query" > /dev/null
+
+        # Get already-applied migrations
+        applied_result=$(curl -s \
+          -X POST \
+          -H "$auth" \
+          -H "Content-Type: application/json" \
+          -d '{"query": "SELECT name FROM public._supabase_admin_migrations ORDER BY name"}' \
+          "$api/projects/$PROJECT_REF/database/query")
+
+        applied_names=$(echo "$applied_result" | jq -r '.[].name // empty' 2>/dev/null || echo "")
+
+        # Run each .sql file in sorted order
+        failed=0
+        applied=0
+        skipped=0
+
+        for file in $(ls -1 "${SCHEMA_DIR}"/*.sql 2>/dev/null | sort); do
+          name=$(basename "$file")
+
+          # Skip if already applied
+          if echo "$applied_names" | grep -qxF "$name"; then
+            echo "  ⏭ Skipping $name (already applied)"
+            skipped=$((skipped + 1))
+            continue
+          fi
+
+          echo "  ▶ Applying $name..."
+          sql=$(cat "$file")
+
+          result=$(curl -s -w "\n%{http_code}" \
+            -X POST \
+            -H "$auth" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg q "$sql" '{query: $q}')" \
+            "$api/projects/$PROJECT_REF/database/query")
+
+          code=$(echo "$result" | tail -1)
+          body=$(echo "$result" | sed '$d')
+
+          if [ "$code" -eq 200 ] || [ "$code" -eq 201 ]; then
+            # Record migration
+            record_sql="INSERT INTO public._supabase_admin_migrations (name) VALUES ('${name//\'/\'\'}');"
+            curl -s \
+              -X POST \
+              -H "$auth" \
+              -H "Content-Type: application/json" \
+              -d "$(jq -n --arg q "$record_sql" '{query: $q}')" \
+              "$api/projects/$PROJECT_REF/database/query" > /dev/null
+
+            echo "    ✓ $name applied successfully"
+            applied=$((applied + 1))
+          else
+            echo "::error::Migration $name failed (HTTP $code)"
+            echo "$body"
+            failed=$((failed + 1))
+          fi
+        done
+
+        echo "::notice::Migrations complete: $applied applied, $skipped skipped, $failed failed"
+
+        if [ "$failed" -gt 0 ]; then
+          exit 1
+        fi
+
+    # ── Step 9: Create storage buckets ───────────────────────────────────
+    - name: Create storage buckets
+      if: ${{ hashFiles(format('{0}/storage.json', inputs.config_dir)) != '' }}
+      shell: bash
+      env:
+        SUPABASE_ACCESS_TOKEN: ${{ inputs.supabase_token }}
+        PROJECT_REF: ${{ steps.resolve-ref.outputs.project_ref }}
+        CONFIG_DIR: ${{ inputs.config_dir }}
+      run: |
+        api="https://api.supabase.com/v1"
+        auth="Authorization: Bearer $SUPABASE_ACCESS_TOKEN"
+
+        buckets=$(cat "${CONFIG_DIR}/storage.json" | jq -c '.buckets[]')
+        created=0
+        updated=0
+        failed=0
+
+        # Get existing buckets
+        existing=$(curl -s \
+          -H "$auth" \
+          "$api/projects/$PROJECT_REF/storage/buckets")
+
+        while IFS= read -r bucket; do
+          name=$(echo "$bucket" | jq -r '.name')
+          bucket_exists=$(echo "$existing" | jq -r --arg n "$name" '.[] | select(.name == $n) | .name // empty')
+
+          if [ -n "$bucket_exists" ]; then
+            # Update existing bucket
+            result=$(curl -s -w "\n%{http_code}" \
+              -X PUT \
+              -H "$auth" \
+              -H "Content-Type: application/json" \
+              -d "$bucket" \
+              "$api/projects/$PROJECT_REF/storage/buckets/$name")
+
+            code=$(echo "$result" | tail -1)
+            body=$(echo "$result" | sed '$d')
+
+            if [ "$code" -eq 200 ]; then
+              echo "  ✓ Bucket '$name' updated"
+              updated=$((updated + 1))
+            else
+              echo "::error::Failed to update bucket '$name' (HTTP $code)"
+              echo "$body"
+              failed=$((failed + 1))
+            fi
+          else
+            # Create new bucket
+            result=$(curl -s -w "\n%{http_code}" \
+              -X POST \
+              -H "$auth" \
+              -H "Content-Type: application/json" \
+              -d "$bucket" \
+              "$api/projects/$PROJECT_REF/storage/buckets")
+
+            code=$(echo "$result" | tail -1)
+            body=$(echo "$result" | sed '$d')
+
+            if [ "$code" -eq 200 ] || [ "$code" -eq 201 ]; then
+              echo "  ✓ Bucket '$name' created"
+              created=$((created + 1))
+            else
+              echo "::error::Failed to create bucket '$name' (HTTP $code)"
+              echo "$body"
+              failed=$((failed + 1))
+            fi
+          fi
+        done <<< "$buckets"
+
+        echo "::notice::Storage buckets: $created created, $updated updated, $failed failed"
+
+        if [ "$failed" -gt 0 ]; then
+          exit 1
+        fi
+
+    # ── Step 10: Push secrets ────────────────────────────────────────────
+    # TODO: secrets_file requires a runtime-generated file because GitHub Actions
+    # does not interpolate ${{ secrets.X }} expressions inside checked-in files.
+    # A future `secrets` inline input (JSON string in the `with:` block) would
+    # let expressions be evaluated directly. For now, callers must generate the
+    # secrets file in a prior step before pointing secrets_file at it.
+    - name: Push secrets
+      if: ${{ inputs.secrets_file != '' && hashFiles(inputs.secrets_file) != '' }}
+      shell: bash
+      env:
+        SUPABASE_ACCESS_TOKEN: ${{ inputs.supabase_token }}
+        PROJECT_REF: ${{ steps.resolve-ref.outputs.project_ref }}
+        SECRETS_FILE: ${{ inputs.secrets_file }}
+      run: |
+        api="https://api.supabase.com/v1"
+        auth="Authorization: Bearer $SUPABASE_ACCESS_TOKEN"
+
+        # Transform {"KEY": "value", ...} into [{"name": "KEY", "value": "value"}, ...]
+        payload=$(cat "$SECRETS_FILE" | jq '[to_entries[] | {name: .key, value: .value}]')
+        count=$(echo "$payload" | jq length)
+
+        result=$(curl -s -w "\n%{http_code}" \
+          -X POST \
+          -H "$auth" \
+          -H "Content-Type: application/json" \
+          -d "$payload" \
+          "$api/projects/$PROJECT_REF/secrets")
+
+        code=$(echo "$result" | tail -1)
+        body=$(echo "$result" | sed '$d')
+
+        if [ "$code" -eq 200 ] || [ "$code" -eq 201 ]; then
+          echo "::notice::$count secret(s) pushed successfully"
+        else
+          echo "::error::Failed to push secrets (HTTP $code)"
+          echo "$body"
+          exit 1
+        fi
+
+    # ── Step 11: Deploy edge functions ───────────────────────────────────
+    - name: Deploy edge functions
+      if: ${{ inputs.functions_dir != '' && hashFiles(format('{0}/*/index.ts', inputs.functions_dir)) != '' }}
+      shell: bash
+      env:
+        SUPABASE_ACCESS_TOKEN: ${{ inputs.supabase_token }}
+        PROJECT_REF: ${{ steps.resolve-ref.outputs.project_ref }}
+        FUNCTIONS_DIR: ${{ inputs.functions_dir }}
+      run: |
+        api="https://api.supabase.com/v1"
+        auth="Authorization: Bearer $SUPABASE_ACCESS_TOKEN"
+
+        deployed=0
+        failed=0
+
+        for func_dir in "${FUNCTIONS_DIR}"/*/; do
+          [ -d "$func_dir" ] || continue
+
+          func_name=$(basename "$func_dir")
+          entry_file="${func_dir}index.ts"
+
+          if [ ! -f "$entry_file" ]; then
+            echo "  ⏭ Skipping $func_name (no index.ts)"
+            continue
+          fi
+
+          echo "  ▶ Deploying function: $func_name"
+
+          # Check if function already exists
+          check=$(curl -s -w "\n%{http_code}" \
+            -H "$auth" \
+            "$api/projects/$PROJECT_REF/functions/$func_name")
+          check_code=$(echo "$check" | tail -1)
+
+          if [ "$check_code" -eq 200 ]; then
+            # Update existing function
+            result=$(curl -s -w "\n%{http_code}" \
+              -X PATCH \
+              -H "$auth" \
+              -H "Content-Type: application/json" \
+              -d "$(jq -n --arg body "$(cat "$entry_file")" --arg name "$func_name" '{name: $name, body: $body, verify_jwt: true}')" \
+              "$api/projects/$PROJECT_REF/functions/$func_name")
+          else
+            # Create new function
+            result=$(curl -s -w "\n%{http_code}" \
+              -X POST \
+              -H "$auth" \
+              -H "Content-Type: application/json" \
+              -d "$(jq -n --arg body "$(cat "$entry_file")" --arg name "$func_name" '{name: $name, slug: $name, body: $body, verify_jwt: true}')" \
+              "$api/projects/$PROJECT_REF/functions")
+          fi
+
+          code=$(echo "$result" | tail -1)
+          body=$(echo "$result" | sed '$d')
+
+          if [ "$code" -eq 200 ] || [ "$code" -eq 201 ]; then
+            echo "    ✓ $func_name deployed"
+            deployed=$((deployed + 1))
+          else
+            echo "::error::Failed to deploy function '$func_name' (HTTP $code)"
+            echo "$body"
+            failed=$((failed + 1))
+          fi
+        done
+
+        echo "::notice::Edge functions: $deployed deployed, $failed failed"
+
+        if [ "$failed" -gt 0 ]; then
+          exit 1
+        fi
+
+    # ── Step 12: Fetch and output project URL + API keys ─────────────────
+    - name: Fetch project outputs
+      id: fetch-outputs
+      shell: bash
+      env:
+        SUPABASE_ACCESS_TOKEN: ${{ inputs.supabase_token }}
+        PROJECT_REF: ${{ steps.resolve-ref.outputs.project_ref }}
+      run: |
+        api="https://api.supabase.com/v1"
+        auth="Authorization: Bearer $SUPABASE_ACCESS_TOKEN"
+
+        # Fetch API keys
+        keys_result=$(curl -s \
+          -H "$auth" \
+          "$api/projects/$PROJECT_REF/api-keys")
+
+        anon_key=$(echo "$keys_result" | jq -r '.[] | select(.name == "anon") | .api_key // empty')
+        service_role_key=$(echo "$keys_result" | jq -r '.[] | select(.name == "service_role") | .api_key // empty')
+
+        project_url="https://${PROJECT_REF}.supabase.co"
+
+        echo "project_url=$project_url" >> "$GITHUB_OUTPUT"
+        echo "anon_key=$anon_key" >> "$GITHUB_OUTPUT"
+        echo "service_role_key=$service_role_key" >> "$GITHUB_OUTPUT"
+
+        # Mask keys in logs
+        if [ -n "$anon_key" ]; then
+          echo "::add-mask::$anon_key"
+        fi
+        if [ -n "$service_role_key" ]; then
+          echo "::add-mask::$service_role_key"
+        fi
+
+        echo "::notice::Project outputs set (project_url, anon_key, service_role_key)"
