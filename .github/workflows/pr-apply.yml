@@ -165,7 +165,7 @@ jobs:
 
       - name: Apply config
         id: apply
-        uses: ./
+        uses: YeahWick/supabase-admin@main
         with:
           mode: apply
           project_ref: ${{ matrix.project_ref }}
