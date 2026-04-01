@@ -1,0 +1,197 @@
+name: Apply Supabase Changes (PR Command)
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  check-trigger:
+    runs-on: ubuntu-latest
+    if: |
+      github.event.issue.pull_request &&
+      startsWith(github.event.comment.body, '/supa-apply')
+    outputs:
+      should_apply: ${{ steps.check.outputs.should_apply }}
+      pr_number: ${{ steps.check.outputs.pr_number }}
+      pr_sha: ${{ steps.check.outputs.pr_sha }}
+      project_filter: ${{ steps.check.outputs.project_filter }}
+    permissions:
+      issues: write
+      pull-requests: read
+      contents: read
+    steps:
+      - name: Check permission and parse command
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COMMENTER: ${{ github.event.comment.user.login }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          # Check write permission
+          permission=$(gh api "repos/${{ github.repository }}/collaborators/$COMMENTER/permission" --jq '.permission' 2>/dev/null || echo "none")
+          if [[ "$permission" != "write" && "$permission" != "admin" && "$permission" != "maintain" ]]; then
+            echo "::warning::$COMMENTER does not have write access, ignoring /supa-apply"
+            echo "should_apply=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Parse optional project filter: "/supa-apply staging" or "/supa-apply"
+          project_filter=$(echo "$COMMENT_BODY" | awk '{print $2}')
+
+          # Get current HEAD SHA of the PR
+          pr_sha=$(gh api "repos/${{ github.repository }}/pulls/$PR_NUMBER" --jq '.head.sha')
+
+          echo "should_apply=true" >> "$GITHUB_OUTPUT"
+          echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "pr_sha=$pr_sha" >> "$GITHUB_OUTPUT"
+          echo "project_filter=$project_filter" >> "$GITHUB_OUTPUT"
+
+      - name: React to comment
+        if: steps.check.outputs.should_apply == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api "repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" \
+            -X POST -f content='+1'
+
+  discover:
+    needs: check-trigger
+    if: needs.check-trigger.outputs.should_apply == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.find-projects.outputs.matrix }}
+      has_projects: ${{ steps.find-projects.outputs.has_projects }}
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.check-trigger.outputs.pr_sha }}
+          fetch-depth: 0
+
+      - name: Find changed project directories
+        id: find-projects
+        env:
+          PR_NUMBER: ${{ needs.check-trigger.outputs.pr_number }}
+          PROJECT_FILTER: ${{ needs.check-trigger.outputs.project_filter }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_SHA: ${{ needs.check-trigger.outputs.pr_sha }}
+        run: |
+          base_sha=$(gh api "repos/${{ github.repository }}/pulls/$PR_NUMBER" --jq '.base.sha')
+          changed=$(git diff --name-only "$base_sha" "$PR_SHA" -- 'projects/')
+          dirs=$(echo "$changed" | grep -oP '^projects/[^/]+' | sort -u)
+
+          matrix_entries=""
+          count=0
+
+          while IFS= read -r dir; do
+            [ -z "$dir" ] && continue
+            project_json="$dir/project.json"
+            [ -f "$project_json" ] || continue
+
+            project_ref=$(jq -r '.project_ref' "$project_json")
+            project_name=$(jq -r '.project_name // ""' "$project_json")
+            env_name=$(jq -r '.environment // "unknown"' "$project_json")
+
+            [ -z "$project_ref" ] && continue
+
+            # Apply project filter if specified
+            if [ -n "$PROJECT_FILTER" ]; then
+              if [ "$env_name" != "$PROJECT_FILTER" ] && [ "$project_name" != "$PROJECT_FILTER" ]; then
+                echo "Skipping $dir (filter: $PROJECT_FILTER)"
+                continue
+              fi
+            fi
+
+            entry=$(jq -n \
+              --arg dir "$dir" \
+              --arg ref "$project_ref" \
+              --arg name "$project_name" \
+              --arg env "$env_name" \
+              '{"dir": $dir, "project_ref": $ref, "project_name": $name, "environment": $env}')
+
+            if [ -n "$matrix_entries" ]; then
+              matrix_entries="${matrix_entries},${entry}"
+            else
+              matrix_entries="$entry"
+            fi
+            count=$((count + 1))
+          done <<< "$dirs"
+
+          echo "matrix={\"include\":[${matrix_entries}]}" >> "$GITHUB_OUTPUT"
+
+          if [ "$count" -gt 0 ]; then
+            echo "has_projects=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_projects=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  apply:
+    needs: [check-trigger, discover]
+    if: needs.discover.outputs.has_projects == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJson(needs.discover.outputs.matrix) }}
+      fail-fast: false
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.check-trigger.outputs.pr_sha }}
+
+      - name: Post status comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ needs.check-trigger.outputs.pr_number }}
+          PROJECT_NAME: ${{ matrix.project_name }}
+          ENVIRONMENT: ${{ matrix.environment }}
+          COMMENTER: ${{ github.event.comment.user.login }}
+        run: |
+          header="$PROJECT_NAME"
+          if [ "$ENVIRONMENT" != "unknown" ] && [ -n "$ENVIRONMENT" ]; then
+            header="$header ($ENVIRONMENT)"
+          fi
+
+          gh pr comment "$PR_NUMBER" --body "$(cat <<EOF
+          <!-- supa-apply-status:${{ matrix.project_ref }} -->
+          Applying changes to **${header}**...
+          Triggered by @${COMMENTER} | [View run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          EOF
+          )"
+
+      - name: Apply config
+        id: apply
+        uses: ./
+        with:
+          mode: apply
+          project_ref: ${{ matrix.project_ref }}
+          config_dir: ${{ matrix.dir }}
+          schema_dir: ${{ matrix.dir }}/migrations
+          functions_dir: ${{ matrix.dir }}/functions
+          supabase_token: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+
+      - name: Post result comment
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ needs.check-trigger.outputs.pr_number }}
+          PROJECT_NAME: ${{ matrix.project_name }}
+          ENVIRONMENT: ${{ matrix.environment }}
+          STATUS: ${{ steps.apply.outcome }}
+        run: |
+          header="$PROJECT_NAME"
+          if [ "$ENVIRONMENT" != "unknown" ] && [ -n "$ENVIRONMENT" ]; then
+            header="$header ($ENVIRONMENT)"
+          fi
+
+          if [ "$STATUS" = "success" ]; then
+            msg="Applied successfully to **${header}**."
+          else
+            msg="Apply **failed** for **${header}**. [View run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+          fi
+
+          gh pr comment "$PR_NUMBER" --body "$msg"
