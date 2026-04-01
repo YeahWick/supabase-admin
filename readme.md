@@ -70,6 +70,95 @@ jobs:
 
 That's it. Pushing changes to `.supabase/` will automatically apply them to your Supabase project.
 
+## Multi-project GitOps workflow
+
+If you manage multiple Supabase projects in one repo, the included workflows give you a full GitOps loop with PR-time plan previews and `/supa-apply` apply commands.
+
+### How it works
+
+| Workflow | Trigger | What it does |
+|---|---|---|
+| `pr-plan.yml` | PR opened/updated touching `projects/**` | Posts a diff comment showing what would change |
+| `pr-apply.yml` | `/supa-apply` comment on a PR | Applies changes immediately (write-access only) |
+| `apply-on-merge.yml` | Push to `main` touching `projects/**` | Auto-applies on merge |
+
+### Setup
+
+#### 1. Add the workflows to your repo
+
+Copy `.github/workflows/pr-plan.yml`, `pr-apply.yml`, and `apply-on-merge.yml` from this repo into your own.
+
+#### 2. Add your Supabase access token
+
+Go to **Settings > Secrets and variables > Actions** and add:
+
+| Secret name | Value |
+|---|---|
+| `SUPABASE_ACCESS_TOKEN` | Personal Access Token from [supabase.com/dashboard/account/tokens](https://supabase.com/dashboard/account/tokens) |
+
+#### 3. Set up a project directory
+
+Create a directory under `projects/` for each Supabase project you want to manage. Add a `project.json` file for auto-discovery:
+
+```
+projects/
+  my-app-production/
+    project.json         # required for auto-discovery
+    auth.json
+    postgrest.json
+    migrations/
+      001_create_todos.sql
+    functions/
+      hello-world/
+        index.ts
+  my-app-staging/
+    project.json
+    auth.json
+```
+
+**`project.json`** — metadata used by the workflows:
+
+```json
+{
+  "project_ref": "abcdefghijklmnop",
+  "project_name": "my-app",
+  "environment": "production"
+}
+```
+
+| Field | Required | Description |
+|---|---|---|
+| `project_ref` | Yes | Supabase project reference ID (found in project settings) |
+| `project_name` | No | Human-readable name shown in PR comments |
+| `environment` | No | Environment label (e.g. `staging`, `production`) shown in PR comments |
+
+### Usage
+
+**Open a PR** that modifies any file under `projects/` — the plan workflow automatically posts a comment showing what would change:
+
+```
+## Supabase Plan: my-app (production)
+> Planned for commit `a1b2c3d`
+
+### Auth Config — ⚠️ changes detected
+| Key | Current | Desired |
+|-----|---------|---------|
+| `jwt_exp` | `3600` | `7200` |
+
+### PostgREST Config — no changes
+
+---
+Comment `/supa-apply` to apply these changes.
+```
+
+**Apply before merge** by commenting `/supa-apply` on the PR. Only collaborators with write access can trigger this. To apply a specific project only:
+
+```
+/supa-apply staging
+```
+
+**Apply on merge** happens automatically when the PR is merged to `main`.
+
 ## Action inputs
 
 | Input | Required | Default | Description |

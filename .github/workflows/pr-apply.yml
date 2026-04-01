@@ -143,6 +143,37 @@ jobs:
         with:
           ref: ${{ needs.check-trigger.outputs.pr_sha }}
 
+      - name: Check for missing token
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ needs.check-trigger.outputs.pr_number }}
+          PROJECT_REF: ${{ matrix.project_ref }}
+          PROJECT_NAME: ${{ matrix.project_name }}
+          ENVIRONMENT: ${{ matrix.environment }}
+        run: |
+          if [ -z "$SUPABASE_ACCESS_TOKEN" ]; then
+            header="${PROJECT_NAME:-$PROJECT_REF}"
+            if [ "$ENVIRONMENT" != "unknown" ] && [ -n "$ENVIRONMENT" ]; then
+              header="$header ($ENVIRONMENT)"
+            fi
+            gh pr comment "$PR_NUMBER" --body "**Error: \`SUPABASE_ACCESS_TOKEN\` secret is not set** — cannot apply changes to **${header}**.
+
+          This workflow needs a Supabase Personal Access Token to apply config changes.
+
+          **To fix:**
+          1. Go to [supabase.com/dashboard/account/tokens](https://supabase.com/dashboard/account/tokens) and create a Personal Access Token
+          2. In this repo, go to **Settings > Secrets and variables > Actions** and add the token with the exact name:
+
+          \`\`\`
+          SUPABASE_ACCESS_TOKEN
+          \`\`\`
+
+          Then comment \`/supa-apply\` again to retry."
+            echo "::error::SUPABASE_ACCESS_TOKEN secret is not set. Add it under Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+
       - name: Post status comment
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -165,7 +196,7 @@ jobs:
 
       - name: Apply config
         id: apply
-        uses: ./
+        uses: YeahWick/supabase-admin@main
         with:
           mode: apply
           project_ref: ${{ matrix.project_ref }}
