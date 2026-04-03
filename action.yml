@@ -36,7 +36,7 @@ inputs:
     description: 'Path to JSON file containing secrets to push to the project'
     required: false
   secrets:
-    description: 'JSON string of secrets to push (e.g. {"KEY": "value"}). Evaluated at runtime, so ${{ secrets.X }} expressions work. Takes precedence over secrets_file.'
+    description: 'JSON string of secrets to push (e.g. {"KEY": "value"}). Takes precedence over secrets_file.'
     required: false
     default: ''
   functions_dir:
