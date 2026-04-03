@@ -6,6 +6,17 @@ on:
     paths:
       - 'projects/**'
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      projects_dir:
+        description: 'Directory containing Supabase project subdirectories'
+        required: false
+        type: string
+        default: 'projects'
+    secrets:
+      SUPABASE_ACCESS_TOKEN:
+        description: 'Supabase Personal Access Token'
+        required: true
 
 jobs:
   discover:
@@ -20,13 +31,15 @@ jobs:
 
       - name: Find changed project directories
         id: find-projects
+        env:
+          PROJECTS_DIR: ${{ inputs.projects_dir || 'projects' }}
         run: |
           if [ "${{ github.event_name }}" = "push" ]; then
-            changed=$(git diff --name-only HEAD~1 HEAD -- 'projects/')
-            dirs=$(echo "$changed" | grep -oP '^projects/[^/]+' | sort -u)
+            changed=$(git diff --name-only HEAD~1 HEAD -- "${PROJECTS_DIR}/")
+            dirs=$(echo "$changed" | grep -oP "^${PROJECTS_DIR}/[^/]+" | sort -u)
           else
             # workflow_dispatch: apply all projects
-            dirs=$(find projects -maxdepth 1 -mindepth 1 -type d 2>/dev/null)
+            dirs=$(find "${PROJECTS_DIR}" -maxdepth 1 -mindepth 1 -type d 2>/dev/null)
           fi
 
           matrix_entries=""
@@ -79,7 +92,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Apply config
-        uses: ./
+        uses: yeahwick/supabase-admin@main
         with:
           mode: apply
           project_ref: ${{ matrix.project_ref }}
