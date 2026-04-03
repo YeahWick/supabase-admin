@@ -134,7 +134,7 @@ jobs:
 
       - name: Run plan
         id: plan
-        uses: yeahwick/supabase-admin@main
+        uses: yeahwick/supabase-admin@fix-pr-apply-action-ref
         with:
           mode: plan
           project_ref: ${{ matrix.project_ref }}

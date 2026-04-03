@@ -99,7 +99,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Apply config
-        uses: yeahwick/supabase-admin@main
+        uses: yeahwick/supabase-admin@fix-pr-apply-action-ref
         with:
           mode: apply
           project_ref: ${{ matrix.project_ref }}
