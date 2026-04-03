@@ -50,7 +50,7 @@ inputs:
     description: 'Path to write markdown plan comment (for posting to PRs). Only used when mode is "plan". Requires plan_output_file to also be set.'
     required: false
     default: ''
-  project_name:
+  plan_project_name:
     description: 'Project name for plan comment header (shown in PR comments)'
     required: false
     default: ''
@@ -87,7 +87,11 @@ runs:
   using: composite
   steps:
 
-    # ── Step 0: Create project (if mode is "create") ─────────────────────
+    # ══════════════════════════════════════════════════════════════════════
+    # SECTION 1 — Project lifecycle
+    # ══════════════════════════════════════════════════════════════════════
+
+    # ── 1a: Provision new project ──────────────────────────────────────
     - name: Create Supabase project
       id: create-project
       if: ${{ inputs.mode == 'create' }}
@@ -115,11 +119,8 @@ runs:
           '{name: $name, organization_id: $org, region: $region, db_pass: $pass}')
 
         result=$(curl -s -w "\n%{http_code}" \
-          -X POST \
-          -H "$auth" \
-          -H "Content-Type: application/json" \
-          -d "$payload" \
-          "$api/projects")
+          -X POST -H "$auth" -H "Content-Type: application/json" \
+          -d "$payload" "$api/projects")
 
         code=$(echo "$result" | tail -1)
         body=$(echo "$result" | sed '$d')
@@ -138,9 +139,7 @@ runs:
         echo "Waiting for project to become healthy..."
         deadline=$((SECONDS + 600))
         while [ $SECONDS -lt $deadline ]; do
-          health=$(curl -s \
-            -H "$auth" \
-            "$api/projects/$ref/health")
+          health=$(curl -s -H "$auth" "$api/projects/$ref/health")
 
           all_healthy=true
           for status in $(echo "$health" | jq -r '.[].status'); do
@@ -163,7 +162,7 @@ runs:
           echo "::warning::Project created but some services may not be healthy yet"
         fi
 
-    # ── Step 1: Resolve effective project_ref ────────────────────────────
+    # ── 1b: Resolve effective project_ref ──────────────────────────────
     - name: Resolve project ref
       id: resolve-ref
       shell: bash
@@ -190,14 +189,14 @@ runs:
           echo "::notice::No project ref provided (plan mode: project will be created)"
         fi
 
-    # ── Init: Set up plan parts directory ────────────────────────────────
+    # ── 1c: Init plan output directory ─────────────────────────────────
     - name: Init plan output
       if: ${{ inputs.mode == 'plan' }}
       shell: bash
       run: |
         mkdir -p /tmp/plan-parts
 
-    # ── Step 1b: Determine project state for plan mode ───────────────────
+    # ── 1d: Determine project state (plan mode only) ────────────────────
     # Sets PROJECT_EXISTS and PROJECT_ACTION env vars used by subsequent steps.
     # PROJECT_ACTION = create | update | delete
     - name: Determine project state
@@ -244,7 +243,11 @@ runs:
           echo "::notice::Plan: project ref $PROJECT_REF does not exist (HTTP $code), planning as CREATE"
         fi
 
-    # ── Apply mode: handle delete ────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════
+    # SECTION 2 — Destructive operations (must run before any config steps)
+    # ══════════════════════════════════════════════════════════════════════
+
+    # ── 2a: Delete project (apply mode only) ──────────────────────────────
     - name: Delete project
       if: ${{ inputs.mode == 'apply' && inputs.delete == 'true' }}
       shell: bash
@@ -269,7 +272,11 @@ runs:
           exit 1
         fi
 
-    # ── Step 2: Auth config ──────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════
+    # SECTION 3 — Config apply (thin wrappers around scripts/apply-config.sh)
+    # ══════════════════════════════════════════════════════════════════════
+
+    # ── 3a: Auth config ─────────────────────────────────────────────────
     - name: Apply auth config
       if: ${{ hashFiles(format('{0}/auth.json', inputs.config_dir)) != '' && inputs.delete != 'true' }}
       shell: bash
@@ -278,69 +285,12 @@ runs:
         PROJECT_REF: ${{ steps.resolve-ref.outputs.project_ref }}
         CONFIG_DIR: ${{ inputs.config_dir }}
         MODE: ${{ inputs.mode }}
+        PROJECT_EXISTS: ${{ env.PROJECT_EXISTS }}
       run: |
-        api="https://api.supabase.com/v1"
-        auth="Authorization: Bearer $SUPABASE_ACCESS_TOKEN"
-        desired=$(jq -S '.' "${CONFIG_DIR}/auth.json")
+        source "$GITHUB_ACTION_PATH/scripts/apply-config.sh" \
+          "auth.json" "auth" "config/auth" "PATCH" "." "keyed"
 
-        # Plan mode: project doesn't exist → emit create plan, skip API
-        if [ "$MODE" = "plan" ] && [ "$PROJECT_EXISTS" = "false" ]; then
-          jq -n --argjson desired "$desired" '{"status":"create","desired":$desired}' > /tmp/plan-parts/auth.json
-          echo "::notice::Auth config: will be created with project"
-          exit 0
-        fi
-
-        # Fetch current state
-        current_result=$(curl -s -w "\n%{http_code}" -H "$auth" "$api/projects/$PROJECT_REF/config/auth")
-        current_code=$(echo "$current_result" | tail -1)
-        current_body=$(echo "$current_result" | sed '$d')
-
-        if [ "$current_code" -ne 200 ]; then
-          echo "::error::Failed to fetch current auth config (HTTP $current_code)"
-          echo "$current_body"
-          exit 1
-        fi
-
-        # Compare only keys present in desired config
-        current_trimmed=$(echo "$current_body" | jq -S --argjson d "$desired" '
-          . as $full | $d | keys_unsorted | reduce .[] as $k ({}; . + {($k): $full[$k]})')
-
-        if [ "$desired" = "$current_trimmed" ]; then
-          echo "::notice::Auth config: no changes"
-          if [ "$MODE" = "plan" ]; then
-            echo '{"status":"no-change"}' > /tmp/plan-parts/auth.json
-          fi
-          exit 0
-        fi
-
-        # Build diff of changed keys
-        diff_json=$(jq -n --argjson desired "$desired" --argjson current "$current_trimmed" '
-          [$desired | keys[] | select($desired[.] != $current[.])] |
-          reduce .[] as $k ({}; . + {($k): {"current": $current[$k], "desired": $desired[$k]}})')
-
-        if [ "$MODE" = "plan" ]; then
-          jq -n --argjson diff "$diff_json" '{"status":"changed","diff":$diff}' > /tmp/plan-parts/auth.json
-          echo "::notice::Auth config: changes detected (plan mode, not applying)"
-          exit 0
-        fi
-
-        # Apply
-        result=$(curl -s -w "\n%{http_code}" \
-          -X PATCH -H "$auth" -H "Content-Type: application/json" \
-          -d "$desired" "$api/projects/$PROJECT_REF/config/auth")
-
-        code=$(echo "$result" | tail -1)
-        body=$(echo "$result" | sed '$d')
-
-        if [ "$code" -eq 200 ]; then
-          echo "::notice::Auth config applied successfully"
-        else
-          echo "::error::Failed to apply auth config (HTTP $code)"
-          echo "$body"
-          exit 1
-        fi
-
-    # ── Step 3: PostgREST config ─────────────────────────────────────────
+    # ── 3b: PostgREST config ────────────────────────────────────────────
     - name: Apply postgrest config
       if: ${{ hashFiles(format('{0}/postgrest.json', inputs.config_dir)) != '' && inputs.delete != 'true' }}
       shell: bash
@@ -349,196 +299,12 @@ runs:
         PROJECT_REF: ${{ steps.resolve-ref.outputs.project_ref }}
         CONFIG_DIR: ${{ inputs.config_dir }}
         MODE: ${{ inputs.mode }}
+        PROJECT_EXISTS: ${{ env.PROJECT_EXISTS }}
       run: |
-        api="https://api.supabase.com/v1"
-        auth="Authorization: Bearer $SUPABASE_ACCESS_TOKEN"
-        desired=$(jq -S '.' "${CONFIG_DIR}/postgrest.json")
+        source "$GITHUB_ACTION_PATH/scripts/apply-config.sh" \
+          "postgrest.json" "postgrest" "postgrest" "PATCH" "." "keyed"
 
-        if [ "$MODE" = "plan" ] && [ "$PROJECT_EXISTS" = "false" ]; then
-          jq -n --argjson desired "$desired" '{"status":"create","desired":$desired}' > /tmp/plan-parts/postgrest.json
-          echo "::notice::PostgREST config: will be created with project"
-          exit 0
-        fi
-
-        current_result=$(curl -s -w "\n%{http_code}" -H "$auth" "$api/projects/$PROJECT_REF/postgrest")
-        current_code=$(echo "$current_result" | tail -1)
-        current_body=$(echo "$current_result" | sed '$d')
-
-        if [ "$current_code" -ne 200 ]; then
-          echo "::error::Failed to fetch current PostgREST config (HTTP $current_code)"
-          echo "$current_body"
-          exit 1
-        fi
-
-        current_trimmed=$(echo "$current_body" | jq -S --argjson d "$desired" '
-          . as $full | $d | keys_unsorted | reduce .[] as $k ({}; . + {($k): $full[$k]})')
-
-        if [ "$desired" = "$current_trimmed" ]; then
-          echo "::notice::PostgREST config: no changes"
-          if [ "$MODE" = "plan" ]; then
-            echo '{"status":"no-change"}' > /tmp/plan-parts/postgrest.json
-          fi
-          exit 0
-        fi
-
-        diff_json=$(jq -n --argjson desired "$desired" --argjson current "$current_trimmed" '
-          [$desired | keys[] | select($desired[.] != $current[.])] |
-          reduce .[] as $k ({}; . + {($k): {"current": $current[$k], "desired": $desired[$k]}})')
-
-        if [ "$MODE" = "plan" ]; then
-          jq -n --argjson diff "$diff_json" '{"status":"changed","diff":$diff}' > /tmp/plan-parts/postgrest.json
-          echo "::notice::PostgREST config: changes detected (plan mode, not applying)"
-          exit 0
-        fi
-
-        result=$(curl -s -w "\n%{http_code}" \
-          -X PATCH -H "$auth" -H "Content-Type: application/json" \
-          -d "$desired" "$api/projects/$PROJECT_REF/postgrest")
-
-        code=$(echo "$result" | tail -1)
-        body=$(echo "$result" | sed '$d')
-
-        if [ "$code" -eq 200 ]; then
-          echo "::notice::PostgREST config applied successfully"
-        else
-          echo "::error::Failed to apply PostgREST config (HTTP $code)"
-          echo "$body"
-          exit 1
-        fi
-
-    # ── Step 4: Network restrictions ─────────────────────────────────────
-    - name: Apply network restrictions
-      if: ${{ hashFiles(format('{0}/network.json', inputs.config_dir)) != '' && inputs.delete != 'true' }}
-      shell: bash
-      env:
-        SUPABASE_ACCESS_TOKEN: ${{ inputs.supabase_token }}
-        PROJECT_REF: ${{ steps.resolve-ref.outputs.project_ref }}
-        CONFIG_DIR: ${{ inputs.config_dir }}
-        MODE: ${{ inputs.mode }}
-      run: |
-        api="https://api.supabase.com/v1"
-        auth="Authorization: Bearer $SUPABASE_ACCESS_TOKEN"
-        desired=$(cat "${CONFIG_DIR}/network.json" | jq -S '{dbAllowedCidrs}')
-
-        if [ "$MODE" = "plan" ] && [ "$PROJECT_EXISTS" = "false" ]; then
-          jq -n --argjson desired "$desired" \
-            '{"status":"create","diff":{"dbAllowedCidrs":{"current":[],"desired":$desired.dbAllowedCidrs}}}' \
-            > /tmp/plan-parts/network.json
-          echo "::notice::Network restrictions: will be created with project"
-          exit 0
-        fi
-
-        current_result=$(curl -s -w "\n%{http_code}" -H "$auth" "$api/projects/$PROJECT_REF/network-restrictions")
-        current_code=$(echo "$current_result" | tail -1)
-        current_body=$(echo "$current_result" | sed '$d')
-
-        if [ "$current_code" -ne 200 ]; then
-          echo "::error::Failed to fetch current network restrictions (HTTP $current_code)"
-          echo "$current_body"
-          exit 1
-        fi
-
-        # Sort CIDR arrays for comparison
-        desired_sorted=$(echo "$desired" | jq -S '{dbAllowedCidrs: (.dbAllowedCidrs | sort)}')
-        current_sorted=$(echo "$current_body" | jq -S '{dbAllowedCidrs: (.dbAllowedCidrs // [] | sort)}')
-
-        if [ "$desired_sorted" = "$current_sorted" ]; then
-          echo "::notice::Network restrictions: no changes"
-          if [ "$MODE" = "plan" ]; then
-            echo '{"status":"no-change"}' > /tmp/plan-parts/network.json
-          fi
-          exit 0
-        fi
-
-        if [ "$MODE" = "plan" ]; then
-          jq -n --argjson desired "$desired_sorted" --argjson current "$current_sorted" \
-            '{"status":"changed","diff":{"dbAllowedCidrs":{"current":$current.dbAllowedCidrs,"desired":$desired.dbAllowedCidrs}}}' \
-            > /tmp/plan-parts/network.json
-          echo "::notice::Network restrictions: changes detected (plan mode, not applying)"
-          exit 0
-        fi
-
-        result=$(curl -s -w "\n%{http_code}" \
-          -X POST -H "$auth" -H "Content-Type: application/json" \
-          -d "$desired" "$api/projects/$PROJECT_REF/network-restrictions/apply")
-
-        code=$(echo "$result" | tail -1)
-        body=$(echo "$result" | sed '$d')
-
-        if [ "$code" -eq 200 ] || [ "$code" -eq 201 ]; then
-          echo "::notice::Network restrictions applied successfully"
-        else
-          echo "::error::Failed to apply network restrictions (HTTP $code)"
-          echo "$body"
-          exit 1
-        fi
-
-    # ── Step 5: SSL enforcement ──────────────────────────────────────────
-    - name: Apply SSL enforcement
-      if: ${{ hashFiles(format('{0}/ssl.json', inputs.config_dir)) != '' && inputs.delete != 'true' }}
-      shell: bash
-      env:
-        SUPABASE_ACCESS_TOKEN: ${{ inputs.supabase_token }}
-        PROJECT_REF: ${{ steps.resolve-ref.outputs.project_ref }}
-        CONFIG_DIR: ${{ inputs.config_dir }}
-        MODE: ${{ inputs.mode }}
-      run: |
-        api="https://api.supabase.com/v1"
-        auth="Authorization: Bearer $SUPABASE_ACCESS_TOKEN"
-        desired=$(cat "${CONFIG_DIR}/ssl.json" | jq -S '{requestedConfig}')
-
-        if [ "$MODE" = "plan" ] && [ "$PROJECT_EXISTS" = "false" ]; then
-          jq -n --argjson desired "$desired" \
-            '{"status":"create","diff":{"requestedConfig":{"current":null,"desired":$desired.requestedConfig}}}' \
-            > /tmp/plan-parts/ssl.json
-          echo "::notice::SSL enforcement: will be created with project"
-          exit 0
-        fi
-
-        current_result=$(curl -s -w "\n%{http_code}" -H "$auth" "$api/projects/$PROJECT_REF/ssl-enforcement")
-        current_code=$(echo "$current_result" | tail -1)
-        current_body=$(echo "$current_result" | sed '$d')
-
-        if [ "$current_code" -ne 200 ]; then
-          echo "::error::Failed to fetch current SSL enforcement (HTTP $current_code)"
-          echo "$current_body"
-          exit 1
-        fi
-
-        current_trimmed=$(echo "$current_body" | jq -S '{requestedConfig}')
-
-        if [ "$desired" = "$current_trimmed" ]; then
-          echo "::notice::SSL enforcement: no changes"
-          if [ "$MODE" = "plan" ]; then
-            echo '{"status":"no-change"}' > /tmp/plan-parts/ssl.json
-          fi
-          exit 0
-        fi
-
-        if [ "$MODE" = "plan" ]; then
-          jq -n --argjson desired "$desired" --argjson current "$current_trimmed" \
-            '{"status":"changed","diff":{"requestedConfig":{"current":$current.requestedConfig,"desired":$desired.requestedConfig}}}' \
-            > /tmp/plan-parts/ssl.json
-          echo "::notice::SSL enforcement: changes detected (plan mode, not applying)"
-          exit 0
-        fi
-
-        result=$(curl -s -w "\n%{http_code}" \
-          -X PUT -H "$auth" -H "Content-Type: application/json" \
-          -d "$desired" "$api/projects/$PROJECT_REF/ssl-enforcement")
-
-        code=$(echo "$result" | tail -1)
-        body=$(echo "$result" | sed '$d')
-
-        if [ "$code" -eq 200 ]; then
-          echo "::notice::SSL enforcement applied successfully"
-        else
-          echo "::error::Failed to apply SSL enforcement (HTTP $code)"
-          echo "$body"
-          exit 1
-        fi
-
-    # ── Step 6: Realtime config ──────────────────────────────────────────
+    # ── 3c: Realtime config ─────────────────────────────────────────────
     - name: Apply realtime config
       if: ${{ hashFiles(format('{0}/realtime.json', inputs.config_dir)) != '' && inputs.delete != 'true' }}
       shell: bash
@@ -547,64 +313,12 @@ runs:
         PROJECT_REF: ${{ steps.resolve-ref.outputs.project_ref }}
         CONFIG_DIR: ${{ inputs.config_dir }}
         MODE: ${{ inputs.mode }}
+        PROJECT_EXISTS: ${{ env.PROJECT_EXISTS }}
       run: |
-        api="https://api.supabase.com/v1"
-        auth="Authorization: Bearer $SUPABASE_ACCESS_TOKEN"
-        desired=$(jq -S '.' "${CONFIG_DIR}/realtime.json")
+        source "$GITHUB_ACTION_PATH/scripts/apply-config.sh" \
+          "realtime.json" "realtime" "config/realtime" "PATCH" "." "keyed"
 
-        if [ "$MODE" = "plan" ] && [ "$PROJECT_EXISTS" = "false" ]; then
-          jq -n --argjson desired "$desired" '{"status":"create","desired":$desired}' > /tmp/plan-parts/realtime.json
-          echo "::notice::Realtime config: will be created with project"
-          exit 0
-        fi
-
-        current_result=$(curl -s -w "\n%{http_code}" -H "$auth" "$api/projects/$PROJECT_REF/config/realtime")
-        current_code=$(echo "$current_result" | tail -1)
-        current_body=$(echo "$current_result" | sed '$d')
-
-        if [ "$current_code" -ne 200 ]; then
-          echo "::error::Failed to fetch current realtime config (HTTP $current_code)"
-          echo "$current_body"
-          exit 1
-        fi
-
-        current_trimmed=$(echo "$current_body" | jq -S --argjson d "$desired" '
-          . as $full | $d | keys_unsorted | reduce .[] as $k ({}; . + {($k): $full[$k]})')
-
-        if [ "$desired" = "$current_trimmed" ]; then
-          echo "::notice::Realtime config: no changes"
-          if [ "$MODE" = "plan" ]; then
-            echo '{"status":"no-change"}' > /tmp/plan-parts/realtime.json
-          fi
-          exit 0
-        fi
-
-        diff_json=$(jq -n --argjson desired "$desired" --argjson current "$current_trimmed" '
-          [$desired | keys[] | select($desired[.] != $current[.])] |
-          reduce .[] as $k ({}; . + {($k): {"current": $current[$k], "desired": $desired[$k]}})')
-
-        if [ "$MODE" = "plan" ]; then
-          jq -n --argjson diff "$diff_json" '{"status":"changed","diff":$diff}' > /tmp/plan-parts/realtime.json
-          echo "::notice::Realtime config: changes detected (plan mode, not applying)"
-          exit 0
-        fi
-
-        result=$(curl -s -w "\n%{http_code}" \
-          -X PATCH -H "$auth" -H "Content-Type: application/json" \
-          -d "$desired" "$api/projects/$PROJECT_REF/config/realtime")
-
-        code=$(echo "$result" | tail -1)
-        body=$(echo "$result" | sed '$d')
-
-        if [ "$code" -eq 200 ]; then
-          echo "::notice::Realtime config applied successfully"
-        else
-          echo "::error::Failed to apply realtime config (HTTP $code)"
-          echo "$body"
-          exit 1
-        fi
-
-    # ── Step 7: Storage config ───────────────────────────────────────────
+    # ── 3d: Storage config ──────────────────────────────────────────────
     - name: Apply storage config
       if: ${{ hashFiles(format('{0}/storage-config.json', inputs.config_dir)) != '' && inputs.delete != 'true' }}
       shell: bash
@@ -613,64 +327,43 @@ runs:
         PROJECT_REF: ${{ steps.resolve-ref.outputs.project_ref }}
         CONFIG_DIR: ${{ inputs.config_dir }}
         MODE: ${{ inputs.mode }}
+        PROJECT_EXISTS: ${{ env.PROJECT_EXISTS }}
       run: |
-        api="https://api.supabase.com/v1"
-        auth="Authorization: Bearer $SUPABASE_ACCESS_TOKEN"
-        desired=$(jq -S '.' "${CONFIG_DIR}/storage-config.json")
+        source "$GITHUB_ACTION_PATH/scripts/apply-config.sh" \
+          "storage-config.json" "storage-config" "config/storage" "PATCH" "." "keyed"
 
-        if [ "$MODE" = "plan" ] && [ "$PROJECT_EXISTS" = "false" ]; then
-          jq -n --argjson desired "$desired" '{"status":"create","desired":$desired}' > /tmp/plan-parts/storage-config.json
-          echo "::notice::Storage config: will be created with project"
-          exit 0
-        fi
+    # ── 3e: SSL enforcement ─────────────────────────────────────────────
+    - name: Apply SSL enforcement
+      if: ${{ hashFiles(format('{0}/ssl.json', inputs.config_dir)) != '' && inputs.delete != 'true' }}
+      shell: bash
+      env:
+        SUPABASE_ACCESS_TOKEN: ${{ inputs.supabase_token }}
+        PROJECT_REF: ${{ steps.resolve-ref.outputs.project_ref }}
+        CONFIG_DIR: ${{ inputs.config_dir }}
+        MODE: ${{ inputs.mode }}
+        PROJECT_EXISTS: ${{ env.PROJECT_EXISTS }}
+      run: |
+        source "$GITHUB_ACTION_PATH/scripts/apply-config.sh" \
+          "ssl.json" "ssl" "ssl-enforcement" "PUT" "{requestedConfig}" "raw"
 
-        current_result=$(curl -s -w "\n%{http_code}" -H "$auth" "$api/projects/$PROJECT_REF/config/storage")
-        current_code=$(echo "$current_result" | tail -1)
-        current_body=$(echo "$current_result" | sed '$d')
+    # ── 3f: Network restrictions ────────────────────────────────────────
+    - name: Apply network restrictions
+      if: ${{ hashFiles(format('{0}/network.json', inputs.config_dir)) != '' && inputs.delete != 'true' }}
+      shell: bash
+      env:
+        SUPABASE_ACCESS_TOKEN: ${{ inputs.supabase_token }}
+        PROJECT_REF: ${{ steps.resolve-ref.outputs.project_ref }}
+        CONFIG_DIR: ${{ inputs.config_dir }}
+        MODE: ${{ inputs.mode }}
+        PROJECT_EXISTS: ${{ env.PROJECT_EXISTS }}
+      run: |
+        source "$GITHUB_ACTION_PATH/scripts/apply-network.sh"
 
-        if [ "$current_code" -ne 200 ]; then
-          echo "::error::Failed to fetch current storage config (HTTP $current_code)"
-          echo "$current_body"
-          exit 1
-        fi
+    # ══════════════════════════════════════════════════════════════════════
+    # SECTION 4 — Data operations
+    # ══════════════════════════════════════════════════════════════════════
 
-        current_trimmed=$(echo "$current_body" | jq -S --argjson d "$desired" '
-          . as $full | $d | keys_unsorted | reduce .[] as $k ({}; . + {($k): $full[$k]})')
-
-        if [ "$desired" = "$current_trimmed" ]; then
-          echo "::notice::Storage config: no changes"
-          if [ "$MODE" = "plan" ]; then
-            echo '{"status":"no-change"}' > /tmp/plan-parts/storage-config.json
-          fi
-          exit 0
-        fi
-
-        diff_json=$(jq -n --argjson desired "$desired" --argjson current "$current_trimmed" '
-          [$desired | keys[] | select($desired[.] != $current[.])] |
-          reduce .[] as $k ({}; . + {($k): {"current": $current[$k], "desired": $desired[$k]}})')
-
-        if [ "$MODE" = "plan" ]; then
-          jq -n --argjson diff "$diff_json" '{"status":"changed","diff":$diff}' > /tmp/plan-parts/storage-config.json
-          echo "::notice::Storage config: changes detected (plan mode, not applying)"
-          exit 0
-        fi
-
-        result=$(curl -s -w "\n%{http_code}" \
-          -X PATCH -H "$auth" -H "Content-Type: application/json" \
-          -d "$desired" "$api/projects/$PROJECT_REF/config/storage")
-
-        code=$(echo "$result" | tail -1)
-        body=$(echo "$result" | sed '$d')
-
-        if [ "$code" -eq 200 ]; then
-          echo "::notice::Storage config applied successfully"
-        else
-          echo "::error::Failed to apply storage config (HTTP $code)"
-          echo "$body"
-          exit 1
-        fi
-
-    # ── Step 8: SQL migrations ───────────────────────────────────────────
+    # ── 4a: SQL migrations ─────────────────────────────────────────────
     - name: Run SQL migrations
       if: ${{ inputs.schema_dir != '' && hashFiles(format('{0}/*.sql', inputs.schema_dir)) != '' && inputs.delete != 'true' }}
       shell: bash
@@ -679,12 +372,13 @@ runs:
         PROJECT_REF: ${{ steps.resolve-ref.outputs.project_ref }}
         SCHEMA_DIR: ${{ inputs.schema_dir }}
         MODE: ${{ inputs.mode }}
+        PROJECT_EXISTS: ${{ env.PROJECT_EXISTS }}
       run: |
         api="https://api.supabase.com/v1"
         auth="Authorization: Bearer $SUPABASE_ACCESS_TOKEN"
 
         # Plan mode: project doesn't exist → list all .sql files as pending
-        if [ "$MODE" = "plan" ] && [ "$PROJECT_EXISTS" = "false" ]; then
+        if [ "$MODE" = "plan" ] && [ "${PROJECT_EXISTS:-}" = "false" ]; then
           pending=()
           for file in $(ls -1 "${SCHEMA_DIR}"/*.sql 2>/dev/null | sort); do
             pending+=("$(basename "$file")")
@@ -706,17 +400,13 @@ runs:
         );"
 
         curl -s -w "\n%{http_code}" \
-          -X POST \
-          -H "$auth" \
-          -H "Content-Type: application/json" \
+          -X POST -H "$auth" -H "Content-Type: application/json" \
           -d "$(jq -n --arg q "$init_sql" '{query: $q}')" \
           "$api/projects/$PROJECT_REF/database/query" > /dev/null
 
         # Get already-applied migrations
         applied_result=$(curl -s \
-          -X POST \
-          -H "$auth" \
-          -H "Content-Type: application/json" \
+          -X POST -H "$auth" -H "Content-Type: application/json" \
           -d '{"query": "SELECT name FROM public._supabase_admin_migrations ORDER BY name"}' \
           "$api/projects/$PROJECT_REF/database/query")
 
@@ -765,9 +455,7 @@ runs:
           sql=$(cat "$file")
 
           result=$(curl -s -w "\n%{http_code}" \
-            -X POST \
-            -H "$auth" \
-            -H "Content-Type: application/json" \
+            -X POST -H "$auth" -H "Content-Type: application/json" \
             -d "$(jq -n --arg q "$sql" '{query: $q}')" \
             "$api/projects/$PROJECT_REF/database/query")
 
@@ -777,9 +465,7 @@ runs:
           if [ "$code" -eq 200 ] || [ "$code" -eq 201 ]; then
             record_sql="INSERT INTO public._supabase_admin_migrations (name) VALUES ('${name//\'/\'\'}');"
             curl -s \
-              -X POST \
-              -H "$auth" \
-              -H "Content-Type: application/json" \
+              -X POST -H "$auth" -H "Content-Type: application/json" \
               -d "$(jq -n --arg q "$record_sql" '{query: $q}')" \
               "$api/projects/$PROJECT_REF/database/query" > /dev/null
 
@@ -798,7 +484,7 @@ runs:
           exit 1
         fi
 
-    # ── Step 9: Storage buckets ──────────────────────────────────────────
+    # ── 4b: Storage buckets ─────────────────────────────────────────────
     - name: Create storage buckets
       if: ${{ hashFiles(format('{0}/storage.json', inputs.config_dir)) != '' && inputs.delete != 'true' }}
       shell: bash
@@ -807,6 +493,7 @@ runs:
         PROJECT_REF: ${{ steps.resolve-ref.outputs.project_ref }}
         CONFIG_DIR: ${{ inputs.config_dir }}
         MODE: ${{ inputs.mode }}
+        PROJECT_EXISTS: ${{ env.PROJECT_EXISTS }}
       run: |
         api="https://api.supabase.com/v1"
         auth="Authorization: Bearer $SUPABASE_ACCESS_TOKEN"
@@ -814,7 +501,7 @@ runs:
         buckets=$(cat "${CONFIG_DIR}/storage.json" | jq -c '.buckets[]')
 
         # Plan mode: project doesn't exist → mark all buckets as create
-        if [ "$MODE" = "plan" ] && [ "$PROJECT_EXISTS" = "false" ]; then
+        if [ "$MODE" = "plan" ] && [ "${PROJECT_EXISTS:-}" = "false" ]; then
           bucket_plans=$(cat "${CONFIG_DIR}/storage.json" | jq '[.buckets[] | {name, action: "create"}]')
           if [ "$(echo "$bucket_plans" | jq length)" -eq 0 ]; then
             echo '{"status":"no-change"}' > /tmp/plan-parts/storage-buckets.json
@@ -836,7 +523,6 @@ runs:
           bucket_exists=$(echo "$existing" | jq -r --arg n "$name" '.[] | select(.name == $n) | .name // empty')
 
           if [ -n "$bucket_exists" ]; then
-            # Check for differences on existing bucket
             existing_bucket=$(echo "$existing" | jq --arg n "$name" '.[] | select(.name == $n)')
             desired_public=$(echo "$bucket" | jq '.public // false')
             current_public=$(echo "$existing_bucket" | jq '.public // false')
@@ -930,15 +616,16 @@ runs:
           exit 1
         fi
 
-    # ── Step 10: Push secrets ────────────────────────────────────────────
+    # ── 4c: Secrets (plan + apply in one step) ───────────────────────────
     - name: Push secrets
-      if: ${{ inputs.secrets_file != '' && hashFiles(inputs.secrets_file) != '' && inputs.mode != 'plan' && inputs.delete != 'true' }}
+      if: ${{ inputs.secrets_file != '' && hashFiles(inputs.secrets_file) != '' && inputs.delete != 'true' }}
       shell: bash
       env:
         SUPABASE_ACCESS_TOKEN: ${{ inputs.supabase_token }}
         PROJECT_REF: ${{ steps.resolve-ref.outputs.project_ref }}
         SECRETS_INLINE: ${{ inputs.secrets }}
         SECRETS_FILE: ${{ inputs.secrets_file }}
+        MODE: ${{ inputs.mode }}
       run: |
         api="https://api.supabase.com/v1"
         auth="Authorization: Bearer $SUPABASE_ACCESS_TOKEN"
@@ -950,14 +637,23 @@ runs:
           secrets_json=$(cat "$SECRETS_FILE")
         fi
 
+        count=$(echo "$secrets_json" | jq 'keys | length')
+        key_names=$(echo "$secrets_json" | jq '[keys[]]')
+
+        if [ "$MODE" = "plan" ]; then
+          jq -n --argjson count "$count" --argjson keys "$key_names" \
+            '{"status":"present","key_count":$count,"keys":$keys,"note":"Secret values are not diffed. Apply to sync."}' \
+            > /tmp/plan-parts/secrets.json
+          echo "::notice::Secrets: $count key(s) present — $(echo "$key_names" | jq -r 'join(", ")') (values not diffed in plan mode)"
+          exit 0
+        fi
+
         # Transform {"KEY": "value", ...} into [{"name": "KEY", "value": "value"}, ...]
         payload=$(echo "$secrets_json" | jq '[to_entries[] | {name: .key, value: .value}]')
-        count=$(echo "$payload" | jq length)
+        push_count=$(echo "$payload" | jq length)
 
         result=$(curl -s -w "\n%{http_code}" \
-          -X POST \
-          -H "$auth" \
-          -H "Content-Type: application/json" \
+          -X POST -H "$auth" -H "Content-Type: application/json" \
           -d "$payload" \
           "$api/projects/$PROJECT_REF/secrets")
 
@@ -965,35 +661,14 @@ runs:
         body=$(echo "$result" | sed '$d')
 
         if [ "$code" -eq 200 ] || [ "$code" -eq 201 ]; then
-          echo "::notice::$count secret(s) pushed successfully"
+          echo "::notice::$push_count secret(s) pushed successfully"
         else
           echo "::error::Failed to push secrets (HTTP $code)"
           echo "$body"
           exit 1
         fi
 
-    # Report secrets presence in plan mode (show key names, never values)
-    - name: Plan secrets
-      if: ${{ inputs.secrets_file != '' && hashFiles(inputs.secrets_file) != '' && inputs.mode == 'plan' && inputs.delete != 'true' }}
-      shell: bash
-      env:
-        SECRETS_INLINE: ${{ inputs.secrets }}
-        SECRETS_FILE: ${{ inputs.secrets_file }}
-      run: |
-        if [ -n "$SECRETS_INLINE" ]; then
-          secrets_json="$SECRETS_INLINE"
-        else
-          secrets_json=$(cat "$SECRETS_FILE")
-        fi
-
-        count=$(echo "$secrets_json" | jq 'keys | length')
-        key_names=$(echo "$secrets_json" | jq '[keys[]]')
-        jq -n --argjson count "$count" --argjson keys "$key_names" \
-          '{"status":"present","key_count":$count,"keys":$keys,"note":"Secret values are not diffed. Apply to sync."}' \
-          > /tmp/plan-parts/secrets.json
-        echo "::notice::Secrets: $count key(s) present — $(echo "$key_names" | jq -r 'join(", ")') (values not diffed in plan mode)"
-
-    # ── Step 11: Deploy edge functions ───────────────────────────────────
+    # ── 4d: Edge functions ───────────────────────────────────────────────
     - name: Deploy edge functions
       if: ${{ inputs.functions_dir != '' && hashFiles(format('{0}/*/index.ts', inputs.functions_dir)) != '' && inputs.delete != 'true' }}
       shell: bash
@@ -1002,12 +677,13 @@ runs:
         PROJECT_REF: ${{ steps.resolve-ref.outputs.project_ref }}
         FUNCTIONS_DIR: ${{ inputs.functions_dir }}
         MODE: ${{ inputs.mode }}
+        PROJECT_EXISTS: ${{ env.PROJECT_EXISTS }}
       run: |
         api="https://api.supabase.com/v1"
         auth="Authorization: Bearer $SUPABASE_ACCESS_TOKEN"
 
         # Plan mode: project doesn't exist → mark all functions as create
-        if [ "$MODE" = "plan" ] && [ "$PROJECT_EXISTS" = "false" ]; then
+        if [ "$MODE" = "plan" ] && [ "${PROJECT_EXISTS:-}" = "false" ]; then
           func_plans="[]"
           for func_dir in "${FUNCTIONS_DIR}"/*/; do
             [ -d "$func_dir" ] || continue
@@ -1038,7 +714,6 @@ runs:
 
           func_exists=$(echo "$existing_funcs" | jq -r --arg n "$func_name" '.[] | select(.slug == $n) | .slug // empty' 2>/dev/null)
 
-          # Read per-function config for plan output
           verify_jwt=true
           func_config="${func_dir}config.json"
           if [ -f "$func_config" ]; then
@@ -1089,7 +764,6 @@ runs:
 
           echo "  Deploying function: $func_name"
 
-          # Read per-function config (verify_jwt defaults to true)
           verify_jwt=true
           func_config="${func_dir}config.json"
           if [ -f "$func_config" ]; then
@@ -1133,7 +807,11 @@ runs:
           exit 1
         fi
 
-    # ── Step 12: Assemble plan output ────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════
+    # SECTION 5 — Plan assembly & output
+    # ══════════════════════════════════════════════════════════════════════
+
+    # ── 5a: Assemble and render plan ─────────────────────────────────────
     - name: Assemble plan output
       id: assemble-plan
       if: ${{ inputs.mode == 'plan' }}
@@ -1142,7 +820,7 @@ runs:
         PROJECT_REF: ${{ steps.resolve-ref.outputs.project_ref }}
         PLAN_OUTPUT_FILE: ${{ inputs.plan_output_file }}
         PLAN_COMMENT_FILE: ${{ inputs.plan_comment_file }}
-        PROJECT_NAME: ${{ inputs.project_name }}
+        PROJECT_NAME: ${{ inputs.plan_project_name }}
         ENVIRONMENT: ${{ inputs.environment }}
       run: |
         # Extract project-level action from _project.json (written by determine-state)
@@ -1154,7 +832,6 @@ runs:
 
         # Merge all remaining plan parts into a single JSON object
         plan='{}'
-
         for part_file in /tmp/plan-parts/*.json; do
           [ -f "$part_file" ] || continue
           key=$(basename "$part_file" .json)
@@ -1191,178 +868,17 @@ runs:
         echo "$final" | jq '.' >> "$GITHUB_STEP_SUMMARY"
         echo '```' >> "$GITHUB_STEP_SUMMARY"
 
-        # Build markdown comment for PR posting
+        # Render markdown comment for PR posting
         if [ -n "$PLAN_COMMENT_FILE" ]; then
-          comment="<!-- supa-plan:${PROJECT_REF} -->"$'\n'
-
-          if [ -n "$PROJECT_NAME" ]; then
-            header="$PROJECT_NAME"
-          else
-            header="$PROJECT_REF"
-          fi
-          if [ -n "$ENVIRONMENT" ]; then
-            header="$header ($ENVIRONMENT)"
-          fi
-
-          if [ "$project_action" = "delete" ]; then
-            comment+="## Supabase Plan: ${header}"$'\n'
-            comment+="> :rotating_light: **This project will be DELETED on apply.**"$'\n\n'
-          elif [ "$project_action" = "create" ]; then
-            comment+="## Supabase Plan: ${header}"$'\n'
-            comment+="> :seedling: **New project — all config will be created.**"$'\n\n'
-          else
-            comment+="## Supabase Plan: ${header}"$'\n\n'
-          fi
-
-          if [ "$has_changes" != "true" ] && [ "$project_action" = "update" ]; then
-            comment+="Everything is up to date. No changes will be applied on merge."$'\n'
-          else
-            # Config sections with table diffs
-            for section in auth postgrest realtime storage-config; do
-              nice_name=""
-              case "$section" in
-                auth) nice_name="Auth Config" ;;
-                postgrest) nice_name="PostgREST Config" ;;
-                realtime) nice_name="Realtime Config" ;;
-                storage-config) nice_name="Storage Config" ;;
-              esac
-
-              status=$(echo "$plan" | jq -r ".\"$section\".status // \"absent\"")
-
-              if [ "$status" = "absent" ]; then
-                continue
-              elif [ "$status" = "no-change" ]; then
-                comment+="### ${nice_name} — no changes"$'\n\n'
-              elif [ "$status" = "changed" ]; then
-                comment+="### ${nice_name} — :warning: changes detected"$'\n'
-                comment+="| Key | Current | Desired |"$'\n'
-                comment+="|-----|---------|---------|"$'\n'
-
-                for k in $(echo "$plan" | jq -r ".$section.diff | keys[]"); do
-                  current=$(echo "$plan" | jq -c ".$section.diff.\"$k\".current")
-                  desired=$(echo "$plan" | jq -c ".$section.diff.\"$k\".desired")
-                  comment+="| \`$k\` | \`$current\` | \`$desired\` |"$'\n'
-                done
-                comment+=$'\n'
-              elif [ "$status" = "create" ]; then
-                comment+="### ${nice_name} — :seedling: will be created"$'\n\n'
-              fi
-            done
-
-            # Network restrictions
-            net_status=$(echo "$plan" | jq -r '.network.status // "absent"')
-            if [ "$net_status" != "absent" ]; then
-              if [ "$net_status" = "no-change" ]; then
-                comment+="### Network Restrictions — no changes"$'\n\n'
-              elif [ "$net_status" = "changed" ]; then
-                comment+="### Network Restrictions — :warning: changes detected"$'\n'
-                comment+="| Key | Current | Desired |"$'\n'
-                comment+="|-----|---------|---------|"$'\n'
-                current=$(echo "$plan" | jq -c '.network.diff.dbAllowedCidrs.current')
-                desired=$(echo "$plan" | jq -c '.network.diff.dbAllowedCidrs.desired')
-                comment+="| \`dbAllowedCidrs\` | \`$current\` | \`$desired\` |"$'\n\n'
-              elif [ "$net_status" = "create" ]; then
-                comment+="### Network Restrictions — :seedling: will be created"$'\n\n'
-              fi
-            fi
-
-            # SSL enforcement
-            ssl_status=$(echo "$plan" | jq -r '.ssl.status // "absent"')
-            if [ "$ssl_status" != "absent" ]; then
-              if [ "$ssl_status" = "no-change" ]; then
-                comment+="### SSL Enforcement — no changes"$'\n\n'
-              elif [ "$ssl_status" = "changed" ]; then
-                comment+="### SSL Enforcement — :warning: changes detected"$'\n'
-                comment+="| Key | Current | Desired |"$'\n'
-                comment+="|-----|---------|---------|"$'\n'
-                current=$(echo "$plan" | jq -c '.ssl.diff.requestedConfig.current')
-                desired=$(echo "$plan" | jq -c '.ssl.diff.requestedConfig.desired')
-                comment+="| \`requestedConfig\` | \`$current\` | \`$desired\` |"$'\n\n'
-              elif [ "$ssl_status" = "create" ]; then
-                comment+="### SSL Enforcement — :seedling: will be created"$'\n\n'
-              fi
-            fi
-
-            # Storage buckets
-            buckets_status=$(echo "$plan" | jq -r '."storage-buckets".status // "absent"')
-            if [ "$buckets_status" != "absent" ]; then
-              if [ "$buckets_status" = "no-change" ]; then
-                comment+="### Storage Buckets — no changes"$'\n\n'
-              elif [ "$buckets_status" = "changed" ]; then
-                comment+="### Storage Buckets — :warning: changes detected"$'\n'
-                comment+="| Bucket | Action | Details |"$'\n'
-                comment+="|--------|--------|---------|"$'\n'
-
-                for row in $(echo "$plan" | jq -c '."storage-buckets".buckets[]'); do
-                  bname=$(echo "$row" | jq -r '.name')
-                  baction=$(echo "$row" | jq -r '.action')
-                  if [ "$baction" = "create" ]; then
-                    comment+="| \`$bname\` | **create** | — |"$'\n'
-                  else
-                    changes=$(echo "$row" | jq -c '.changes // {}' | sed 's/"/`/g')
-                    comment+="| \`$bname\` | update | $changes |"$'\n'
-                  fi
-                done
-                comment+=$'\n'
-              elif [ "$buckets_status" = "create" ]; then
-                comment+="### Storage Buckets — :seedling: will be created"$'\n\n'
-              fi
-            fi
-
-            # SQL migrations
-            mig_status=$(echo "$plan" | jq -r '.migrations.status // "absent"')
-            if [ "$mig_status" != "absent" ]; then
-              if [ "$mig_status" = "no-change" ]; then
-                comment+="### SQL Migrations — no pending"$'\n\n'
-              elif [ "$mig_status" = "pending" ]; then
-                count=$(echo "$plan" | jq '.migrations.pending | length')
-                comment+="### SQL Migrations — :warning: ${count} pending"$'\n'
-                for m in $(echo "$plan" | jq -r '.migrations.pending[]'); do
-                  comment+="- \`$m\`"$'\n'
-                done
-                comment+=$'\n'
-              fi
-            fi
-
-            # Edge functions
-            func_status=$(echo "$plan" | jq -r '.functions.status // "absent"')
-            if [ "$func_status" != "absent" ]; then
-              if [ "$func_status" = "no-change" ]; then
-                comment+="### Edge Functions — no changes"$'\n\n'
-              elif [ "$func_status" = "changed" ]; then
-                comment+="### Edge Functions — :warning: changes detected"$'\n'
-                comment+="| Function | Action |"$'\n'
-                comment+="|----------|--------|"$'\n'
-                for row in $(echo "$plan" | jq -c '.functions.functions[]'); do
-                  fname=$(echo "$row" | jq -r '.name')
-                  faction=$(echo "$row" | jq -r '.action')
-                  if [ "$faction" = "create" ]; then
-                    comment+="| \`$fname\` | **create** |"$'\n'
-                  else
-                    comment+="| \`$fname\` | update |"$'\n'
-                  fi
-                done
-                comment+=$'\n'
-              fi
-            fi
-
-            # Secrets
-            sec_status=$(echo "$plan" | jq -r '.secrets.status // "absent"')
-            if [ "$sec_status" = "present" ]; then
-              sec_count=$(echo "$plan" | jq -r '.secrets.key_count')
-              comment+="### Secrets — ${sec_count} key(s) present"$'\n'
-              comment+="> Secret values are not diffed. Apply to sync."$'\n\n'
-            fi
-
-            comment+="---"$'\n'
-            comment+="Comment \`/supa-apply\` to apply these changes, or \`/supa-plan\` to re-run the plan."$'\n'
-          fi
-
-          echo "$comment" > "$PLAN_COMMENT_FILE"
-          echo "::notice::Plan comment written to $PLAN_COMMENT_FILE"
+          PLAN_JSON="$final" \
+          source "$GITHUB_ACTION_PATH/scripts/render-plan-comment.sh"
         fi
 
-    # ── Step 13: Fetch and output project URL + API keys ─────────────────
+    # ══════════════════════════════════════════════════════════════════════
+    # SECTION 6 — Project outputs (fetch API keys after apply)
+    # ══════════════════════════════════════════════════════════════════════
+
+    # ── 6a: Fetch and output project URL + API keys ─────────────────────
     - name: Fetch project outputs
       id: fetch-outputs
       if: ${{ inputs.mode != 'plan' && inputs.delete != 'true' }}
@@ -1375,9 +891,7 @@ runs:
         auth="Authorization: Bearer $SUPABASE_ACCESS_TOKEN"
 
         # Fetch API keys
-        keys_result=$(curl -s \
-          -H "$auth" \
-          "$api/projects/$PROJECT_REF/api-keys")
+        keys_result=$(curl -s -H "$auth" "$api/projects/$PROJECT_REF/api-keys")
 
         anon_key=$(echo "$keys_result" | jq -r '.[] | select(.name == "anon") | .api_key // empty')
         service_role_key=$(echo "$keys_result" | jq -r '.[] | select(.name == "service_role") | .api_key // empty')
