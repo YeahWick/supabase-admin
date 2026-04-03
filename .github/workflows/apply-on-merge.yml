@@ -37,18 +37,25 @@ jobs:
             project_json="$dir/project.json"
             [ -f "$project_json" ] || continue
 
-            project_ref=$(jq -r '.project_ref' "$project_json")
+            project_ref=$(jq -r '.project_ref // ""' "$project_json")
             project_name=$(jq -r '.project_name // ""' "$project_json")
             env_name=$(jq -r '.environment // "unknown"' "$project_json")
+            delete_flag=$(jq -r '.delete // false' "$project_json")
 
-            [ -z "$project_ref" ] && continue
+            # apply-on-merge does not auto-create projects (needs org/db_password).
+            # Skip if no ref unless this is a delete (delete also needs ref).
+            if [ -z "$project_ref" ]; then
+              echo "::warning::$dir has no project_ref; skipping (use mode=create manually to provision)"
+              continue
+            fi
 
             entry=$(jq -n \
               --arg dir "$dir" \
               --arg ref "$project_ref" \
               --arg name "$project_name" \
               --arg env "$env_name" \
-              '{"dir": $dir, "project_ref": $ref, "project_name": $name, "environment": $env}')
+              --arg del "$delete_flag" \
+              '{"dir": $dir, "project_ref": $ref, "project_name": $name, "environment": $env, "delete": $del}')
 
             if [ -n "$matrix_entries" ]; then
               matrix_entries="${matrix_entries},${entry}"
@@ -86,4 +93,5 @@ jobs:
           config_dir: ${{ matrix.dir }}
           schema_dir: ${{ matrix.dir }}/migrations
           functions_dir: ${{ matrix.dir }}/functions
+          delete: ${{ matrix.delete }}
           supabase_token: ${{ secrets.SUPABASE_ACCESS_TOKEN }}

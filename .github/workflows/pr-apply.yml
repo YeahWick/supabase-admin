@@ -91,11 +91,17 @@ jobs:
             project_json="$dir/project.json"
             [ -f "$project_json" ] || continue
 
-            project_ref=$(jq -r '.project_ref' "$project_json")
+            project_ref=$(jq -r '.project_ref // ""' "$project_json")
             project_name=$(jq -r '.project_name // ""' "$project_json")
             env_name=$(jq -r '.environment // "unknown"' "$project_json")
+            delete_flag=$(jq -r '.delete // false' "$project_json")
 
-            [ -z "$project_ref" ] && continue
+            # pr-apply doesn't auto-create projects (no org/db_password inputs).
+            # Skip if no ref.
+            if [ -z "$project_ref" ]; then
+              echo "Skipping $dir (no project_ref; create projects manually with mode=create)"
+              continue
+            fi
 
             # Apply project filter if specified
             if [ -n "$PROJECT_FILTER" ]; then
@@ -110,7 +116,8 @@ jobs:
               --arg ref "$project_ref" \
               --arg name "$project_name" \
               --arg env "$env_name" \
-              '{"dir": $dir, "project_ref": $ref, "project_name": $name, "environment": $env}')
+              --arg del "$delete_flag" \
+              '{"dir": $dir, "project_ref": $ref, "project_name": $name, "environment": $env, "delete": $del}')
 
             if [ -n "$matrix_entries" ]; then
               matrix_entries="${matrix_entries},${entry}"
@@ -172,6 +179,7 @@ jobs:
           config_dir: ${{ matrix.dir }}
           schema_dir: ${{ matrix.dir }}/migrations
           functions_dir: ${{ matrix.dir }}/functions
+          delete: ${{ matrix.delete }}
           supabase_token: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
 
       - name: Post result comment

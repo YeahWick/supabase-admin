@@ -42,6 +42,10 @@ inputs:
     description: 'Path to write JSON plan output (used by PR workflows to build comments). Only used when mode is "plan"'
     required: false
     default: ''
+  delete:
+    description: 'When "true", plan/apply will destroy the project (DELETE /v1/projects/<ref>) and skip all config steps'
+    required: false
+    default: 'false'
   supabase_token:
     description: 'Supabase Personal Access Token (PAT)'
     required: true
@@ -156,12 +160,19 @@ runs:
           ref="$CREATED_REF"
         elif [ -n "$INPUT_REF" ]; then
           ref="$INPUT_REF"
+        elif [ "$MODE" = "plan" ]; then
+          # Plan mode allows missing ref — it means "project will be created"
+          ref=""
         else
-          echo "::error::project_ref is required when mode is 'apply' or 'plan'"
+          echo "::error::project_ref is required when mode is 'apply'"
           exit 1
         fi
         echo "project_ref=$ref" >> "$GITHUB_OUTPUT"
-        echo "::notice::Using project ref: $ref"
+        if [ -n "$ref" ]; then
+          echo "::notice::Using project ref: $ref"
+        else
+          echo "::notice::No project ref provided (plan mode: project will be created)"
+        fi
 
     # ── Init: Set up plan parts directory ────────────────────────────────
     - name: Init plan output
@@ -170,9 +181,81 @@ runs:
       run: |
         mkdir -p /tmp/plan-parts
 
+    # ── Step 1b: Determine project state for plan mode ───────────────────
+    # Sets PROJECT_EXISTS and PROJECT_ACTION env vars used by subsequent steps.
+    # PROJECT_ACTION = create | update | delete
+    - name: Determine project state
+      if: ${{ inputs.mode == 'plan' }}
+      shell: bash
+      env:
+        SUPABASE_ACCESS_TOKEN: ${{ inputs.supabase_token }}
+        PROJECT_REF: ${{ steps.resolve-ref.outputs.project_ref }}
+        DELETE: ${{ inputs.delete }}
+      run: |
+        if [ "$DELETE" = "true" ]; then
+          if [ -z "$PROJECT_REF" ]; then
+            echo "::error::delete=true requires a project_ref to know what to delete"
+            exit 1
+          fi
+          echo "PROJECT_EXISTS=true" >> "$GITHUB_ENV"
+          echo "PROJECT_ACTION=delete" >> "$GITHUB_ENV"
+          echo '{"action":"delete","project_ref":"'"$PROJECT_REF"'"}' > /tmp/plan-parts/_project.json
+          echo "::notice::Plan: project $PROJECT_REF will be DELETED"
+          exit 0
+        fi
+
+        if [ -z "$PROJECT_REF" ]; then
+          echo "PROJECT_EXISTS=false" >> "$GITHUB_ENV"
+          echo "PROJECT_ACTION=create" >> "$GITHUB_ENV"
+          echo '{"action":"create"}' > /tmp/plan-parts/_project.json
+          echo "::notice::Plan: project will be CREATED (no ref provided)"
+          exit 0
+        fi
+
+        api="https://api.supabase.com/v1"
+        auth="Authorization: Bearer $SUPABASE_ACCESS_TOKEN"
+        code=$(curl -s -o /dev/null -w "%{http_code}" -H "$auth" "$api/projects/$PROJECT_REF")
+
+        if [ "$code" -eq 200 ]; then
+          echo "PROJECT_EXISTS=true" >> "$GITHUB_ENV"
+          echo "PROJECT_ACTION=update" >> "$GITHUB_ENV"
+          echo '{"action":"update","project_ref":"'"$PROJECT_REF"'"}' > /tmp/plan-parts/_project.json
+          echo "::notice::Plan: project $PROJECT_REF exists, diffing config"
+        else
+          echo "PROJECT_EXISTS=false" >> "$GITHUB_ENV"
+          echo "PROJECT_ACTION=create" >> "$GITHUB_ENV"
+          echo '{"action":"create","attempted_ref":"'"$PROJECT_REF"'"}' > /tmp/plan-parts/_project.json
+          echo "::notice::Plan: project ref $PROJECT_REF does not exist (HTTP $code), planning as CREATE"
+        fi
+
+    # ── Apply mode: handle delete ────────────────────────────────────────
+    - name: Delete project
+      if: ${{ inputs.mode == 'apply' && inputs.delete == 'true' }}
+      shell: bash
+      env:
+        SUPABASE_ACCESS_TOKEN: ${{ inputs.supabase_token }}
+        PROJECT_REF: ${{ steps.resolve-ref.outputs.project_ref }}
+      run: |
+        if [ -z "$PROJECT_REF" ]; then
+          echo "::error::delete=true requires a project_ref"
+          exit 1
+        fi
+        api="https://api.supabase.com/v1"
+        auth="Authorization: Bearer $SUPABASE_ACCESS_TOKEN"
+        result=$(curl -s -w "\n%{http_code}" -X DELETE -H "$auth" "$api/projects/$PROJECT_REF")
+        code=$(echo "$result" | tail -1)
+        body=$(echo "$result" | sed '$d')
+        if [ "$code" -eq 200 ] || [ "$code" -eq 204 ]; then
+          echo "::notice::Project $PROJECT_REF deleted"
+        else
+          echo "::error::Failed to delete project (HTTP $code)"
+          echo "$body"
+          exit 1
+        fi
+
     # ── Step 2: Auth config ──────────────────────────────────────────────
     - name: Apply auth config
-      if: ${{ hashFiles(format('{0}/auth.json', inputs.config_dir)) != '' }}
+      if: ${{ hashFiles(format('{0}/auth.json', inputs.config_dir)) != '' && inputs.delete != 'true' }}
       shell: bash
       env:
         SUPABASE_ACCESS_TOKEN: ${{ inputs.supabase_token }}
@@ -183,6 +266,13 @@ runs:
         api="https://api.supabase.com/v1"
         auth="Authorization: Bearer $SUPABASE_ACCESS_TOKEN"
         desired=$(jq -S '.' "${CONFIG_DIR}/auth.json")
+
+        # Plan mode: project doesn't exist → emit create plan, skip API
+        if [ "$MODE" = "plan" ] && [ "$PROJECT_EXISTS" = "false" ]; then
+          jq -n --argjson desired "$desired" '{"status":"create","desired":$desired}' > /tmp/plan-parts/auth.json
+          echo "::notice::Auth config: will be created with project"
+          exit 0
+        fi
 
         # Fetch current state
         current_result=$(curl -s -w "\n%{http_code}" -H "$auth" "$api/projects/$PROJECT_REF/config/auth")
@@ -236,7 +326,7 @@ runs:
 
     # ── Step 3: PostgREST config ─────────────────────────────────────────
     - name: Apply postgrest config
-      if: ${{ hashFiles(format('{0}/postgrest.json', inputs.config_dir)) != '' }}
+      if: ${{ hashFiles(format('{0}/postgrest.json', inputs.config_dir)) != '' && inputs.delete != 'true' }}
       shell: bash
       env:
         SUPABASE_ACCESS_TOKEN: ${{ inputs.supabase_token }}
@@ -247,6 +337,12 @@ runs:
         api="https://api.supabase.com/v1"
         auth="Authorization: Bearer $SUPABASE_ACCESS_TOKEN"
         desired=$(jq -S '.' "${CONFIG_DIR}/postgrest.json")
+
+        if [ "$MODE" = "plan" ] && [ "$PROJECT_EXISTS" = "false" ]; then
+          jq -n --argjson desired "$desired" '{"status":"create","desired":$desired}' > /tmp/plan-parts/postgrest.json
+          echo "::notice::PostgREST config: will be created with project"
+          exit 0
+        fi
 
         current_result=$(curl -s -w "\n%{http_code}" -H "$auth" "$api/projects/$PROJECT_REF/postgrest")
         current_code=$(echo "$current_result" | tail -1)
@@ -296,7 +392,7 @@ runs:
 
     # ── Step 4: Network restrictions ─────────────────────────────────────
     - name: Apply network restrictions
-      if: ${{ hashFiles(format('{0}/network.json', inputs.config_dir)) != '' }}
+      if: ${{ hashFiles(format('{0}/network.json', inputs.config_dir)) != '' && inputs.delete != 'true' }}
       shell: bash
       env:
         SUPABASE_ACCESS_TOKEN: ${{ inputs.supabase_token }}
@@ -307,6 +403,14 @@ runs:
         api="https://api.supabase.com/v1"
         auth="Authorization: Bearer $SUPABASE_ACCESS_TOKEN"
         desired=$(cat "${CONFIG_DIR}/network.json" | jq -S '{dbAllowedCidrs}')
+
+        if [ "$MODE" = "plan" ] && [ "$PROJECT_EXISTS" = "false" ]; then
+          jq -n --argjson desired "$desired" \
+            '{"status":"create","diff":{"dbAllowedCidrs":{"current":[],"desired":$desired.dbAllowedCidrs}}}' \
+            > /tmp/plan-parts/network.json
+          echo "::notice::Network restrictions: will be created with project"
+          exit 0
+        fi
 
         current_result=$(curl -s -w "\n%{http_code}" -H "$auth" "$api/projects/$PROJECT_REF/network-restrictions")
         current_code=$(echo "$current_result" | tail -1)
@@ -355,7 +459,7 @@ runs:
 
     # ── Step 5: SSL enforcement ──────────────────────────────────────────
     - name: Apply SSL enforcement
-      if: ${{ hashFiles(format('{0}/ssl.json', inputs.config_dir)) != '' }}
+      if: ${{ hashFiles(format('{0}/ssl.json', inputs.config_dir)) != '' && inputs.delete != 'true' }}
       shell: bash
       env:
         SUPABASE_ACCESS_TOKEN: ${{ inputs.supabase_token }}
@@ -366,6 +470,14 @@ runs:
         api="https://api.supabase.com/v1"
         auth="Authorization: Bearer $SUPABASE_ACCESS_TOKEN"
         desired=$(cat "${CONFIG_DIR}/ssl.json" | jq -S '{requestedConfig}')
+
+        if [ "$MODE" = "plan" ] && [ "$PROJECT_EXISTS" = "false" ]; then
+          jq -n --argjson desired "$desired" \
+            '{"status":"create","diff":{"requestedConfig":{"current":null,"desired":$desired.requestedConfig}}}' \
+            > /tmp/plan-parts/ssl.json
+          echo "::notice::SSL enforcement: will be created with project"
+          exit 0
+        fi
 
         current_result=$(curl -s -w "\n%{http_code}" -H "$auth" "$api/projects/$PROJECT_REF/ssl-enforcement")
         current_code=$(echo "$current_result" | tail -1)
@@ -412,7 +524,7 @@ runs:
 
     # ── Step 6: Realtime config ──────────────────────────────────────────
     - name: Apply realtime config
-      if: ${{ hashFiles(format('{0}/realtime.json', inputs.config_dir)) != '' }}
+      if: ${{ hashFiles(format('{0}/realtime.json', inputs.config_dir)) != '' && inputs.delete != 'true' }}
       shell: bash
       env:
         SUPABASE_ACCESS_TOKEN: ${{ inputs.supabase_token }}
@@ -423,6 +535,12 @@ runs:
         api="https://api.supabase.com/v1"
         auth="Authorization: Bearer $SUPABASE_ACCESS_TOKEN"
         desired=$(jq -S '.' "${CONFIG_DIR}/realtime.json")
+
+        if [ "$MODE" = "plan" ] && [ "$PROJECT_EXISTS" = "false" ]; then
+          jq -n --argjson desired "$desired" '{"status":"create","desired":$desired}' > /tmp/plan-parts/realtime.json
+          echo "::notice::Realtime config: will be created with project"
+          exit 0
+        fi
 
         current_result=$(curl -s -w "\n%{http_code}" -H "$auth" "$api/projects/$PROJECT_REF/config/realtime")
         current_code=$(echo "$current_result" | tail -1)
@@ -472,7 +590,7 @@ runs:
 
     # ── Step 7: Storage config ───────────────────────────────────────────
     - name: Apply storage config
-      if: ${{ hashFiles(format('{0}/storage-config.json', inputs.config_dir)) != '' }}
+      if: ${{ hashFiles(format('{0}/storage-config.json', inputs.config_dir)) != '' && inputs.delete != 'true' }}
       shell: bash
       env:
         SUPABASE_ACCESS_TOKEN: ${{ inputs.supabase_token }}
@@ -483,6 +601,12 @@ runs:
         api="https://api.supabase.com/v1"
         auth="Authorization: Bearer $SUPABASE_ACCESS_TOKEN"
         desired=$(jq -S '.' "${CONFIG_DIR}/storage-config.json")
+
+        if [ "$MODE" = "plan" ] && [ "$PROJECT_EXISTS" = "false" ]; then
+          jq -n --argjson desired "$desired" '{"status":"create","desired":$desired}' > /tmp/plan-parts/storage-config.json
+          echo "::notice::Storage config: will be created with project"
+          exit 0
+        fi
 
         current_result=$(curl -s -w "\n%{http_code}" -H "$auth" "$api/projects/$PROJECT_REF/config/storage")
         current_code=$(echo "$current_result" | tail -1)
@@ -532,7 +656,7 @@ runs:
 
     # ── Step 8: SQL migrations ───────────────────────────────────────────
     - name: Run SQL migrations
-      if: ${{ inputs.schema_dir != '' && hashFiles(format('{0}/*.sql', inputs.schema_dir)) != '' }}
+      if: ${{ inputs.schema_dir != '' && hashFiles(format('{0}/*.sql', inputs.schema_dir)) != '' && inputs.delete != 'true' }}
       shell: bash
       env:
         SUPABASE_ACCESS_TOKEN: ${{ inputs.supabase_token }}
@@ -542,6 +666,22 @@ runs:
       run: |
         api="https://api.supabase.com/v1"
         auth="Authorization: Bearer $SUPABASE_ACCESS_TOKEN"
+
+        # Plan mode: project doesn't exist → list all .sql files as pending
+        if [ "$MODE" = "plan" ] && [ "$PROJECT_EXISTS" = "false" ]; then
+          pending=()
+          for file in $(ls -1 "${SCHEMA_DIR}"/*.sql 2>/dev/null | sort); do
+            pending+=("$(basename "$file")")
+          done
+          if [ ${#pending[@]} -eq 0 ]; then
+            echo '{"status":"no-change"}' > /tmp/plan-parts/migrations.json
+          else
+            pending_json=$(printf '%s\n' "${pending[@]}" | jq -R . | jq -s .)
+            jq -n --argjson pending "$pending_json" '{"status":"pending","pending":$pending}' > /tmp/plan-parts/migrations.json
+            echo "::notice::SQL migrations: ${#pending[@]} will be applied after project creation"
+          fi
+          exit 0
+        fi
 
         # Ensure migrations tracking table exists
         init_sql="CREATE TABLE IF NOT EXISTS public._supabase_admin_migrations (
@@ -644,7 +784,7 @@ runs:
 
     # ── Step 9: Storage buckets ──────────────────────────────────────────
     - name: Create storage buckets
-      if: ${{ hashFiles(format('{0}/storage.json', inputs.config_dir)) != '' }}
+      if: ${{ hashFiles(format('{0}/storage.json', inputs.config_dir)) != '' && inputs.delete != 'true' }}
       shell: bash
       env:
         SUPABASE_ACCESS_TOKEN: ${{ inputs.supabase_token }}
@@ -656,6 +796,18 @@ runs:
         auth="Authorization: Bearer $SUPABASE_ACCESS_TOKEN"
 
         buckets=$(cat "${CONFIG_DIR}/storage.json" | jq -c '.buckets[]')
+
+        # Plan mode: project doesn't exist → mark all buckets as create
+        if [ "$MODE" = "plan" ] && [ "$PROJECT_EXISTS" = "false" ]; then
+          bucket_plans=$(cat "${CONFIG_DIR}/storage.json" | jq '[.buckets[] | {name, action: "create"}]')
+          if [ "$(echo "$bucket_plans" | jq length)" -eq 0 ]; then
+            echo '{"status":"no-change"}' > /tmp/plan-parts/storage-buckets.json
+          else
+            jq -n --argjson buckets "$bucket_plans" '{"status":"changed","buckets":$buckets}' > /tmp/plan-parts/storage-buckets.json
+            echo "::notice::Storage buckets: will be created with project"
+          fi
+          exit 0
+        fi
 
         # Get existing buckets
         existing=$(curl -s -H "$auth" "$api/projects/$PROJECT_REF/storage/buckets")
@@ -769,7 +921,7 @@ runs:
     # let expressions be evaluated directly. For now, callers must generate the
     # secrets file in a prior step before pointing secrets_file at it.
     - name: Push secrets
-      if: ${{ inputs.secrets_file != '' && hashFiles(inputs.secrets_file) != '' && inputs.mode != 'plan' }}
+      if: ${{ inputs.secrets_file != '' && hashFiles(inputs.secrets_file) != '' && inputs.mode != 'plan' && inputs.delete != 'true' }}
       shell: bash
       env:
         SUPABASE_ACCESS_TOKEN: ${{ inputs.supabase_token }}
@@ -803,7 +955,7 @@ runs:
 
     # Report secrets presence in plan mode (never diff values)
     - name: Plan secrets
-      if: ${{ inputs.secrets_file != '' && hashFiles(inputs.secrets_file) != '' && inputs.mode == 'plan' }}
+      if: ${{ inputs.secrets_file != '' && hashFiles(inputs.secrets_file) != '' && inputs.mode == 'plan' && inputs.delete != 'true' }}
       shell: bash
       env:
         SECRETS_FILE: ${{ inputs.secrets_file }}
@@ -816,7 +968,7 @@ runs:
 
     # ── Step 11: Deploy edge functions ───────────────────────────────────
     - name: Deploy edge functions
-      if: ${{ inputs.functions_dir != '' && hashFiles(format('{0}/*/index.ts', inputs.functions_dir)) != '' }}
+      if: ${{ inputs.functions_dir != '' && hashFiles(format('{0}/*/index.ts', inputs.functions_dir)) != '' && inputs.delete != 'true' }}
       shell: bash
       env:
         SUPABASE_ACCESS_TOKEN: ${{ inputs.supabase_token }}
@@ -826,6 +978,24 @@ runs:
       run: |
         api="https://api.supabase.com/v1"
         auth="Authorization: Bearer $SUPABASE_ACCESS_TOKEN"
+
+        # Plan mode: project doesn't exist → mark all functions as create
+        if [ "$MODE" = "plan" ] && [ "$PROJECT_EXISTS" = "false" ]; then
+          func_plans="[]"
+          for func_dir in "${FUNCTIONS_DIR}"/*/; do
+            [ -d "$func_dir" ] || continue
+            func_name=$(basename "$func_dir")
+            [ -f "${func_dir}index.ts" ] || continue
+            func_plans=$(echo "$func_plans" | jq --arg n "$func_name" '. + [{"name":$n,"action":"create"}]')
+          done
+          if [ "$(echo "$func_plans" | jq length)" -eq 0 ]; then
+            echo '{"status":"no-change"}' > /tmp/plan-parts/functions.json
+          else
+            jq -n --argjson funcs "$func_plans" '{"status":"changed","functions":$funcs}' > /tmp/plan-parts/functions.json
+            echo "::notice::Edge functions: will be deployed with project"
+          fi
+          exit 0
+        fi
 
         # Get existing functions list
         existing_funcs=$(curl -s -H "$auth" "$api/projects/$PROJECT_REF/functions")
@@ -925,7 +1095,14 @@ runs:
         PROJECT_REF: ${{ steps.resolve-ref.outputs.project_ref }}
         PLAN_OUTPUT_FILE: ${{ inputs.plan_output_file }}
       run: |
-        # Merge all plan parts into a single JSON object
+        # Extract project-level action from _project.json (written by determine-state)
+        project_action="update"
+        if [ -f /tmp/plan-parts/_project.json ]; then
+          project_action=$(jq -r '.action' /tmp/plan-parts/_project.json)
+          rm /tmp/plan-parts/_project.json
+        fi
+
+        # Merge all remaining plan parts into a single JSON object
         plan='{}'
 
         for part_file in /tmp/plan-parts/*.json; do
@@ -935,16 +1112,21 @@ runs:
           plan=$(echo "$plan" | jq --arg k "$key" --argjson v "$value" '. + {($k): $v}')
         done
 
-        # Check if any section has changes
-        has_changes=$(echo "$plan" | jq '[.[] | .status] | any(. != "no-change")')
+        # has_changes: true for create/delete, otherwise check sections
+        if [ "$project_action" = "create" ] || [ "$project_action" = "delete" ]; then
+          has_changes=true
+        else
+          has_changes=$(echo "$plan" | jq '[.[] | .status] | any(. != "no-change")')
+        fi
 
         # Build final plan JSON
         final=$(jq -n \
           --arg ref "$PROJECT_REF" \
+          --arg action "$project_action" \
           --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
           --argjson changes "$plan" \
           --argjson has_changes "$has_changes" \
-          '{project_ref: $ref, timestamp: $ts, changes: $changes, has_changes: $has_changes}')
+          '{project_ref: $ref, project_action: $action, timestamp: $ts, changes: $changes, has_changes: $has_changes}')
 
         echo "has_changes=$has_changes" >> "$GITHUB_OUTPUT"
 
@@ -962,7 +1144,7 @@ runs:
     # ── Step 13: Fetch and output project URL + API keys ─────────────────
     - name: Fetch project outputs
       id: fetch-outputs
-      if: ${{ inputs.mode != 'plan' }}
+      if: ${{ inputs.mode != 'plan' && inputs.delete != 'true' }}
       shell: bash
       env:
         SUPABASE_ACCESS_TOKEN: ${{ inputs.supabase_token }}
