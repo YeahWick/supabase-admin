@@ -1,0 +1,95 @@
+name: 'Check Supabase Trigger'
+description: 'Validates PR comment triggers (/supa-plan, /supa-apply): checks permissions, resolves PR context, reacts to the comment. Outputs whether the trigger is allowed and PR metadata.'
+
+inputs:
+  command:
+    description: 'Command to match (e.g. /supa-plan or /supa-apply)'
+    required: true
+    type: string
+  react:
+    description: 'Add 👍 reaction to the triggering comment'
+    required: false
+    default: 'true'
+    type: string
+
+outputs:
+  allowed:
+    description: 'Whether the trigger is allowed (true/false)'
+    value: ${{ steps.check.outputs.allowed }}
+  pr_number:
+    description: 'PR number'
+    value: ${{ steps.check.outputs.pr_number }}
+  pr_sha:
+    description: 'HEAD SHA of the PR'
+    value: ${{ steps.check.outputs.pr_sha }}
+  project_filter:
+    description: 'Optional project filter from command (e.g. /supa-apply staging → staging)'
+    value: ${{ steps.check.outputs.project_filter }}
+
+runs:
+  using: composite
+  steps:
+    - name: Check permission and resolve PR context
+      id: check
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        COMMAND: ${{ inputs.command }}
+        EVENT_NAME: ${{ github.event_name }}
+        COMMENT_BODY: ${{ github.event.comment.body }}
+        COMMENTER: ${{ github.event.comment.user.login }}
+        PR_ISSUE_NUMBER: ${{ github.event.issue.number }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        REPOSITORY: ${{ github.repository }}
+        COMMENT_ID: ${{ github.event.comment.id }}
+        REACT: ${{ inputs.react }}
+      run: |
+        # For pull_request events, always allow
+        if [ "$EVENT_NAME" = "pull_request" ]; then
+          echo "allowed=true" >> "$GITHUB_OUTPUT"
+          echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "pr_sha=$PR_HEAD_SHA" >> "$GITHUB_OUTPUT"
+          echo "project_filter=" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        # For issue_comment events, check that it's on a PR and matches the command
+        if [ "$EVENT_NAME" = "issue_comment" ]; then
+          # Must be on a PR (github.event.issue.pull_request is set only for PR comments)
+          if [ -z "${{ github.event.issue.pull_request }}" ]; then
+            echo "allowed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Must match the command
+          if ! echo "$COMMENT_BODY" | grep -q "^${COMMAND}"; then
+            echo "allowed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Check write permission
+          permission=$(gh api "repos/$REPOSITORY/collaborators/$COMMENTER/permission" --jq '.permission' 2>/dev/null || echo "none")
+          if [[ "$permission" != "write" && "$permission" != "admin" && "$permission" != "maintain" ]]; then
+            echo "::warning::$COMMENTER does not have write access, ignoring $COMMAND"
+            echo "allowed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Parse optional project filter
+          project_filter=$(echo "$COMMENT_BODY" | awk '{print $2}')
+
+          # Resolve PR HEAD SHA
+          pr_sha=$(gh api "repos/$REPOSITORY/pulls/$PR_ISSUE_NUMBER" --jq '.head.sha')
+
+          echo "allowed=true" >> "$GITHUB_OUTPUT"
+          echo "pr_number=$PR_ISSUE_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "pr_sha=$pr_sha" >> "$GITHUB_OUTPUT"
+          echo "project_filter=$project_filter" >> "$GITHUB_OUTPUT"
+
+          # Add reaction
+          if [ "$REACT" = "true" ] && [ -n "$COMMENT_ID" ]; then
+            gh api "repos/$REPOSITORY/issues/comments/$COMMENT_ID/reactions" \
+              -X POST -f content='+1' || true
+          fi
+        fi
