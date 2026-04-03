@@ -47,7 +47,7 @@ jobs:
               continue
             fi
 
-            entry=$(jq -n \
+            entry=$(jq -nc \
               --arg dir "$dir" \
               --arg ref "$project_ref" \
               --arg name "$project_name" \
