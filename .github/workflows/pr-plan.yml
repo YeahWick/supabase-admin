@@ -5,6 +5,17 @@ on:
     paths:
       - 'projects/**'
     types: [opened, synchronize, reopened]
+  workflow_call:
+    inputs:
+      projects_dir:
+        description: 'Directory containing Supabase project subdirectories'
+        required: false
+        type: string
+        default: 'projects'
+    secrets:
+      SUPABASE_ACCESS_TOKEN:
+        description: 'Supabase Personal Access Token'
+        required: true
 
 jobs:
   discover:
@@ -22,9 +33,10 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PROJECTS_DIR: ${{ inputs.projects_dir || 'projects' }}
         run: |
-          changed=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- 'projects/')
-          dirs=$(echo "$changed" | grep -oP '^projects/[^/]+' | sort -u)
+          changed=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- "${PROJECTS_DIR}/")
+          dirs=$(echo "$changed" | grep -oP "^${PROJECTS_DIR}/[^/]+" | sort -u)
 
           matrix_entries=""
           count=0
@@ -119,7 +131,7 @@ jobs:
 
       - name: Run plan
         id: plan
-        uses: ./
+        uses: yeahwick/supabase-admin@main
         with:
           mode: plan
           project_ref: ${{ matrix.project_ref }}
