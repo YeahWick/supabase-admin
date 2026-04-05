@@ -172,6 +172,7 @@ Comment `/supa-apply` to apply these changes.
 | `config_dir` | No | `.supabase` | Directory containing config JSON files |
 | `schema_dir` | No | — | Directory containing `.sql` migration files |
 | `secrets_file` | No | — | Path to JSON file with secrets to push |
+| `secrets` | No | — | JSON string of secrets (e.g. `'{"KEY": "value"}'`). Supports `${{ secrets.X }}` expressions. Takes precedence over `secrets_file` |
 | `functions_dir` | No | — | Directory containing edge function subdirectories |
 | `supabase_token` | Yes | — | Supabase Personal Access Token |
 
@@ -389,7 +390,16 @@ Example:
 
 Secrets pushed via `POST /v1/projects/{ref}/secrets`. These are available as environment variables in Edge Functions and in Postgres Vault.
 
-The file is a simple key-value JSON object with placeholder values. Because GitHub Actions does **not** interpolate `${{ secrets.X }}` expressions inside checked-in files, you must generate the secrets file at runtime in a prior step and point `secrets_file` at the generated path:
+**Option 1: Inline `secrets` input (recommended)** — Use the `secrets` input to pass a JSON string directly. GitHub Actions evaluates `${{ secrets.X }}` expressions in the `with:` block, so no extra step is needed:
+
+```yaml
+- uses: yeahwick/supabase-admin@main
+  with:
+    secrets: '{"STRIPE_SECRET_KEY": "${{ secrets.STRIPE_KEY }}", "RESEND_API_KEY": "${{ secrets.RESEND_KEY }}"}'
+    supabase_token: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+```
+
+**Option 2: `secrets_file`** — Generate a file at runtime and point `secrets_file` at it. Useful when you have many secrets or prefer to build the file dynamically:
 
 ```yaml
 - name: Generate secrets file
@@ -407,7 +417,7 @@ The file is a simple key-value JSON object with placeholder values. Because GitH
     supabase_token: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
 ```
 
-> **TODO:** A future `secrets` inline input will accept a JSON string directly in the `with:` block (where expressions are evaluated), removing the need for the extra generation step.
+If both `secrets` and `secrets_file` are provided, `secrets` takes precedence.
 
 ## SQL migrations
 
@@ -434,9 +444,24 @@ Point `functions_dir` at a directory where each subdirectory is an edge function
     index.ts
   process-webhook/
     index.ts
+    config.json
 ```
 
 Functions are created or updated automatically. JWT verification is enabled by default.
+
+### Per-function config
+
+Add an optional `config.json` alongside `index.ts` to configure per-function settings:
+
+```json
+{
+  "verify_jwt": false
+}
+```
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `verify_jwt` | boolean | `true` | When `false`, the function can be called without a valid JWT. Useful for webhooks and public endpoints |
 
 ## Zero-touch deployment example
 
@@ -515,6 +540,25 @@ jobs:
           config_dir: ${{ matrix.config_dir }}
           supabase_token: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
 ```
+
+## PR workflows
+
+When using this repo directly (with per-project configs in `projects/`), two PR workflows are included:
+
+### Plan on PR (`pr-plan.yml`)
+
+Automatically comments on PRs with a preview of changes when files under `projects/` are modified. This runs the action in `plan` mode to show what would change without applying anything.
+
+### Apply from PR (`pr-apply.yml`)
+
+Comment `/supa-apply` on a PR to apply changes from the PR branch to your Supabase projects. Only collaborators with **write** access or higher can trigger it.
+
+```
+/supa-apply              # Apply all changed projects
+/supa-apply staging      # Apply only the project matching environment or name "staging"
+```
+
+The workflow discovers which `projects/` directories changed in the PR, reads each `project.json` for the project ref, and applies the config. Status and results are posted as PR comments.
 
 ## Using this repo directly
 
