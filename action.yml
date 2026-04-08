@@ -35,6 +35,10 @@ inputs:
   secrets_file:
     description: 'Path to JSON file containing secrets to push to the project'
     required: false
+  secrets:
+    description: 'JSON string of secrets to push (e.g. {"KEY": "value"}). Evaluated at runtime, so ${{ secrets.X }} expressions work. Takes precedence over secrets_file.'
+    required: false
+    default: ''
   functions_dir:
     description: 'Directory containing edge function subdirectories to deploy'
     required: false
@@ -763,24 +767,27 @@ runs:
         fi
 
     # ── Step 10: Push secrets ────────────────────────────────────────────
-    # TODO: secrets_file requires a runtime-generated file because GitHub Actions
-    # does not interpolate ${{ secrets.X }} expressions inside checked-in files.
-    # A future `secrets` inline input (JSON string in the `with:` block) would
-    # let expressions be evaluated directly. For now, callers must generate the
-    # secrets file in a prior step before pointing secrets_file at it.
     - name: Push secrets
-      if: ${{ inputs.secrets_file != '' && hashFiles(inputs.secrets_file) != '' && inputs.mode != 'plan' }}
+      if: ${{ (inputs.secrets != '' || (inputs.secrets_file != '' && hashFiles(inputs.secrets_file) != '')) && inputs.mode != 'plan' }}
       shell: bash
       env:
         SUPABASE_ACCESS_TOKEN: ${{ inputs.supabase_token }}
         PROJECT_REF: ${{ steps.resolve-ref.outputs.project_ref }}
+        SECRETS_INLINE: ${{ inputs.secrets }}
         SECRETS_FILE: ${{ inputs.secrets_file }}
       run: |
         api="https://api.supabase.com/v1"
         auth="Authorization: Bearer $SUPABASE_ACCESS_TOKEN"
 
+        # Inline secrets input takes precedence over secrets_file
+        if [ -n "$SECRETS_INLINE" ]; then
+          secrets_json="$SECRETS_INLINE"
+        else
+          secrets_json=$(cat "$SECRETS_FILE")
+        fi
+
         # Transform {"KEY": "value", ...} into [{"name": "KEY", "value": "value"}, ...]
-        payload=$(cat "$SECRETS_FILE" | jq '[to_entries[] | {name: .key, value: .value}]')
+        payload=$(echo "$secrets_json" | jq '[to_entries[] | {name: .key, value: .value}]')
         count=$(echo "$payload" | jq length)
 
         result=$(curl -s -w "\n%{http_code}" \
@@ -801,18 +808,26 @@ runs:
           exit 1
         fi
 
-    # Report secrets presence in plan mode (never diff values)
+    # Report secrets presence in plan mode (show key names, never values)
     - name: Plan secrets
-      if: ${{ inputs.secrets_file != '' && hashFiles(inputs.secrets_file) != '' && inputs.mode == 'plan' }}
+      if: ${{ (inputs.secrets != '' || (inputs.secrets_file != '' && hashFiles(inputs.secrets_file) != '')) && inputs.mode == 'plan' }}
       shell: bash
       env:
+        SECRETS_INLINE: ${{ inputs.secrets }}
         SECRETS_FILE: ${{ inputs.secrets_file }}
       run: |
-        count=$(cat "$SECRETS_FILE" | jq 'keys | length')
-        jq -n --argjson count "$count" \
-          '{"status":"present","key_count":$count,"note":"Secret values are not diffed. Apply to sync."}' \
+        if [ -n "$SECRETS_INLINE" ]; then
+          secrets_json="$SECRETS_INLINE"
+        else
+          secrets_json=$(cat "$SECRETS_FILE")
+        fi
+
+        count=$(echo "$secrets_json" | jq 'keys | length')
+        key_names=$(echo "$secrets_json" | jq '[keys[]]')
+        jq -n --argjson count "$count" --argjson keys "$key_names" \
+          '{"status":"present","key_count":$count,"keys":$keys,"note":"Secret values are not diffed. Apply to sync."}' \
           > /tmp/plan-parts/secrets.json
-        echo "::notice::Secrets: $count key(s) present (values not diffed in plan mode)"
+        echo "::notice::Secrets: $count key(s) present — $(echo "$key_names" | jq -r 'join(", ")') (values not diffed in plan mode)"
 
     # ── Step 11: Deploy edge functions ───────────────────────────────────
     - name: Deploy edge functions
@@ -841,6 +856,16 @@ runs:
 
           func_exists=$(echo "$existing_funcs" | jq -r --arg n "$func_name" '.[] | select(.slug == $n) | .slug // empty' 2>/dev/null)
 
+          # Read per-function config for plan output
+          verify_jwt=true
+          func_config="${func_dir}config.json"
+          if [ -f "$func_config" ]; then
+            jwt_val=$(jq -r '.verify_jwt // empty' "$func_config")
+            if [ "$jwt_val" = "false" ]; then
+              verify_jwt=false
+            fi
+          fi
+
           if [ -n "$func_exists" ]; then
             action="update"
           else
@@ -853,7 +878,7 @@ runs:
             has_func_changes=true
           fi
 
-          func_plans=$(echo "$func_plans" | jq --arg n "$func_name" --arg a "$action" '. + [{"name":$n,"action":$a}]')
+          func_plans=$(echo "$func_plans" | jq --arg n "$func_name" --arg a "$action" --argjson jwt "$verify_jwt" '. + [{"name":$n,"action":$a,"verify_jwt":$jwt}]')
         done
 
         if [ "$has_func_changes" = false ]; then
@@ -882,18 +907,28 @@ runs:
 
           echo "  Deploying function: $func_name"
 
+          # Read per-function config (verify_jwt defaults to true)
+          verify_jwt=true
+          func_config="${func_dir}config.json"
+          if [ -f "$func_config" ]; then
+            jwt_val=$(jq -r '.verify_jwt // empty' "$func_config")
+            if [ "$jwt_val" = "false" ]; then
+              verify_jwt=false
+            fi
+          fi
+
           check=$(curl -s -w "\n%{http_code}" -H "$auth" "$api/projects/$PROJECT_REF/functions/$func_name")
           check_code=$(echo "$check" | tail -1)
 
           if [ "$check_code" -eq 200 ]; then
             result=$(curl -s -w "\n%{http_code}" \
               -X PATCH -H "$auth" -H "Content-Type: application/json" \
-              -d "$(jq -n --arg body "$(cat "$entry_file")" --arg name "$func_name" '{name: $name, body: $body, verify_jwt: true}')" \
+              -d "$(jq -n --arg body "$(cat "$entry_file")" --arg name "$func_name" --argjson jwt "$verify_jwt" '{name: $name, body: $body, verify_jwt: $jwt}')" \
               "$api/projects/$PROJECT_REF/functions/$func_name")
           else
             result=$(curl -s -w "\n%{http_code}" \
               -X POST -H "$auth" -H "Content-Type: application/json" \
-              -d "$(jq -n --arg body "$(cat "$entry_file")" --arg name "$func_name" '{name: $name, slug: $name, body: $body, verify_jwt: true}')" \
+              -d "$(jq -n --arg body "$(cat "$entry_file")" --arg name "$func_name" --argjson jwt "$verify_jwt" '{name: $name, slug: $name, body: $body, verify_jwt: $jwt}')" \
               "$api/projects/$PROJECT_REF/functions")
           fi
 
