@@ -1,5 +1,4 @@
 {
-  "project_ref": "your-project-ref-here",
   "project_name": "supabase-example",
   "environment": "staging"
 }

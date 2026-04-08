@@ -50,12 +50,14 @@ jobs:
               continue
             fi
 
-            project_ref=$(jq -r '.project_ref' "$project_json")
+            project_ref=$(jq -r '.project_ref // ""' "$project_json")
             project_name=$(jq -r '.project_name // ""' "$project_json")
             env_name=$(jq -r '.environment // "unknown"' "$project_json")
+            delete_flag=$(jq -r '.delete // false' "$project_json")
 
-            if [ -z "$project_ref" ]; then
-              echo "::warning::$dir/project.json has no project_ref, skipping"
+            # delete=true requires a ref to know what to delete
+            if [ "$delete_flag" = "true" ] && [ -z "$project_ref" ]; then
+              echo "::warning::$dir has delete: true but no project_ref, skipping"
               continue
             fi
 
@@ -64,7 +66,8 @@ jobs:
               --arg ref "$project_ref" \
               --arg name "$project_name" \
               --arg env "$env_name" \
-              '{"dir": $dir, "project_ref": $ref, "project_name": $name, "environment": $env}')
+              --arg del "$delete_flag" \
+              '{"dir": $dir, "project_ref": $ref, "project_name": $name, "environment": $env, "delete": $del}')
 
             if [ -n "$matrix_entries" ]; then
               matrix_entries="${matrix_entries},${entry}"
@@ -131,7 +134,7 @@ jobs:
 
       - name: Run plan
         id: plan
-        uses: yeahwick/supabase-admin@main
+        uses: yeahwick/supabase-admin@fix-pr-apply-action-ref
         with:
           mode: plan
           project_ref: ${{ matrix.project_ref }}
@@ -139,6 +142,7 @@ jobs:
           schema_dir: ${{ matrix.dir }}/migrations
           functions_dir: ${{ matrix.dir }}/functions
           plan_output_file: /tmp/plan.json
+          delete: ${{ matrix.delete }}
           supabase_token: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
 
       - name: Build comment markdown
@@ -148,28 +152,46 @@ jobs:
           PROJECT_NAME: ${{ matrix.project_name }}
           ENVIRONMENT: ${{ matrix.environment }}
           PROJECT_REF: ${{ matrix.project_ref }}
+          PROJECT_DIR: ${{ matrix.dir }}
           PR_SHA: ${{ github.event.pull_request.head.sha }}
           HAS_CHANGES: ${{ steps.plan.outputs.has_changes }}
         run: |
           short_sha="${PR_SHA:0:7}"
-          comment="<!-- supa-plan:${PROJECT_REF} -->"$'\n'
+          # Marker uses ref when present, else dir (for create plans without a ref yet)
+          marker_id="${PROJECT_REF:-$PROJECT_DIR}"
+          comment="<!-- supa-plan:${marker_id} -->"$'\n'
 
           if [ -n "$PROJECT_NAME" ]; then
             header="$PROJECT_NAME"
-          else
+          elif [ -n "$PROJECT_REF" ]; then
             header="$PROJECT_REF"
+          else
+            header="$PROJECT_DIR"
           fi
           if [ "$ENVIRONMENT" != "unknown" ] && [ -n "$ENVIRONMENT" ]; then
             header="$header ($ENVIRONMENT)"
           fi
 
+          plan=$(cat "$PLAN_FILE" 2>/dev/null || echo '{}')
+          project_action=$(echo "$plan" | jq -r '.project_action // "update"')
+
           comment+="## Supabase Plan: ${header}"$'\n'
           comment+="> Planned for commit \`${short_sha}\`"$'\n\n'
 
-          if [ "$HAS_CHANGES" != "true" ]; then
+          if [ "$project_action" = "delete" ]; then
+            comment+=":rotating_light: **This project will be DELETED on merge.**"$'\n\n'
+            comment+="Project ref \`${PROJECT_REF}\` will be permanently destroyed. All databases, storage, functions, and configuration will be lost."$'\n\n'
+            comment+="---"$'\n'
+            comment+="Comment \`/supa-apply\` to confirm and apply this deletion."$'\n'
+          elif [ "$project_action" = "create" ]; then
+            comment+=":sparkles: **A new project will be created on merge.**"$'\n\n'
+            comment+="The following will be provisioned:"$'\n\n'
+          fi
+
+          if [ "$project_action" != "delete" ] && [ "$HAS_CHANGES" != "true" ]; then
             comment+="Everything is up to date. No changes will be applied on merge."$'\n'
-          else
-            plan=$(cat "$PLAN_FILE")
+          elif [ "$project_action" != "delete" ]; then
+            :
 
             # Config sections with table diffs
             for section in auth postgrest realtime storage-config; do
@@ -197,6 +219,15 @@ jobs:
                   comment+="| \`$k\` | \`$current\` | \`$desired\` |"$'\n'
                 done
                 comment+=$'\n'
+              elif [ "$status" = "create" ]; then
+                comment+="### ${nice_name} — :sparkles: will be created"$'\n'
+                comment+="| Key | Desired |"$'\n'
+                comment+="|-----|---------|"$'\n'
+                for k in $(echo "$plan" | jq -r ".changes.\"$key\".desired | keys[]"); do
+                  desired=$(echo "$plan" | jq -c ".changes.\"$key\".desired.\"$k\"")
+                  comment+="| \`$k\` | \`$desired\` |"$'\n'
+                done
+                comment+=$'\n'
               fi
             done
 
@@ -204,8 +235,12 @@ jobs:
             net_status=$(echo "$plan" | jq -r '.changes.network.status // "absent"')
             if [ "$net_status" = "no-change" ]; then
               comment+="### Network Restrictions — no changes"$'\n\n'
-            elif [ "$net_status" = "changed" ]; then
-              comment+="### Network Restrictions — :warning: changes detected"$'\n'
+            elif [ "$net_status" = "changed" ] || [ "$net_status" = "create" ]; then
+              if [ "$net_status" = "create" ]; then
+                comment+="### Network Restrictions — :sparkles: will be created"$'\n'
+              else
+                comment+="### Network Restrictions — :warning: changes detected"$'\n'
+              fi
               comment+="| Key | Current | Desired |"$'\n'
               comment+="|-----|---------|---------|"$'\n'
               current=$(echo "$plan" | jq -c '.changes.network.diff.dbAllowedCidrs.current')
@@ -217,8 +252,12 @@ jobs:
             ssl_status=$(echo "$plan" | jq -r '.changes.ssl.status // "absent"')
             if [ "$ssl_status" = "no-change" ]; then
               comment+="### SSL Enforcement — no changes"$'\n\n'
-            elif [ "$ssl_status" = "changed" ]; then
-              comment+="### SSL Enforcement — :warning: changes detected"$'\n'
+            elif [ "$ssl_status" = "changed" ] || [ "$ssl_status" = "create" ]; then
+              if [ "$ssl_status" = "create" ]; then
+                comment+="### SSL Enforcement — :sparkles: will be created"$'\n'
+              else
+                comment+="### SSL Enforcement — :warning: changes detected"$'\n'
+              fi
               current=$(echo "$plan" | jq -c '.changes.ssl.diff.requestedConfig.current')
               desired=$(echo "$plan" | jq -c '.changes.ssl.diff.requestedConfig.desired')
               comment+="| Key | Current | Desired |"$'\n'
@@ -305,7 +344,7 @@ jobs:
         with:
           issue-number: ${{ github.event.pull_request.number }}
           comment-author: 'github-actions[bot]'
-          body-includes: '<!-- supa-plan:${{ matrix.project_ref }} -->'
+          body-includes: ${{ format('<!-- supa-plan:{0} -->', matrix.project_ref || matrix.dir) }}
 
       - name: Create or update PR comment
         uses: peter-evans/create-or-update-comment@v4

@@ -163,8 +163,9 @@ Comment `/supa-apply` to apply these changes.
 
 | Input | Required | Default | Description |
 |---|---|---|---|
-| `mode` | No | `apply` | `"apply"` to configure an existing project, `"create"` to provision a new one first |
-| `project_ref` | No* | — | Supabase project reference ID. *Required when mode is `apply` |
+| `mode` | No | `apply` | `"apply"` to configure an existing project, `"create"` to provision a new one first, or `"plan"` to preview changes without applying |
+| `project_ref` | No* | — | Supabase project reference ID. *Required when mode is `apply`. In `plan` mode, leave empty to plan a new project. |
+| `delete` | No | `false` | When `"true"`, plan/apply will destroy the project (`DELETE /v1/projects/<ref>`) and skip all config steps. Used by PR workflows when `delete: true` is set in `project.json`. |
 | `organization_id` | No* | — | Supabase organization ID. *Required when mode is `create` |
 | `project_name` | No* | — | Name for the new project. *Required when mode is `create` |
 | `region` | No | `us-east-1` | Region for the new project (only used with `create`) |
@@ -563,3 +564,24 @@ The workflow discovers which `projects/` directories changed in the PR, reads ea
 ## Using this repo directly
 
 This repo also includes inspection and mutation workflows for centralized management of multiple Supabase projects. See the `.github/workflows/` directory and the `projects/` directory for per-project config examples.
+
+### PR plan/apply lifecycle
+
+When a project lives in `projects/<name>/`, the `pr-plan.yml` and `pr-apply.yml` workflows recognize three lifecycle states from `project.json`:
+
+| State | `project_ref` | `delete` | Plan output |
+|---|---|---|---|
+| **Create** | `""` (empty) | (omitted) | All configs marked as new; project is provisioned on apply |
+| **Update** | set, project exists | (omitted) | Diff of current vs desired |
+| **Delete** | set | `true` | Destroy plan; project is deleted on apply |
+
+Example `project.json` for deletion:
+
+```json
+{
+  "project_ref": "abcdefghijklmnop",
+  "project_name": "my-old-app",
+  "environment": "staging",
+  "delete": true
+}
+```
