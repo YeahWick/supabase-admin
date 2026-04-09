@@ -5,6 +5,8 @@ on:
     paths:
       - 'projects/**'
     types: [opened, synchronize, reopened]
+  issue_comment:
+    types: [created]
   workflow_call:
     inputs:
       projects_dir:
@@ -18,24 +20,99 @@ on:
         required: true
 
 jobs:
+  check-trigger:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'issue_comment'
+    outputs:
+      should_plan: ${{ steps.check.outputs.should_plan }}
+      pr_number: ${{ steps.check.outputs.pr_number }}
+      pr_sha: ${{ steps.check.outputs.pr_sha }}
+    permissions:
+      issues: write
+      pull-requests: write
+      contents: read
+    steps:
+      - name: Check permission and parse command
+        id: check
+        if: |
+          github.event.issue.pull_request &&
+          startsWith(github.event.comment.body, '/supa-plan')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COMMENTER: ${{ github.event.comment.user.login }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          # Check write permission
+          permission=$(gh api "repos/${{ github.repository }}/collaborators/$COMMENTER/permission" --jq '.permission' 2>/dev/null || echo "none")
+          if [[ "$permission" != "write" && "$permission" != "admin" && "$permission" != "maintain" ]]; then
+            echo "::warning::$COMMENTER does not have write access, ignoring /supa-plan"
+            echo "should_plan=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Get current HEAD SHA of the PR
+          pr_sha=$(gh api "repos/${{ github.repository }}/pulls/$PR_NUMBER" --jq '.head.sha')
+
+          echo "should_plan=true" >> "$GITHUB_OUTPUT"
+          echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "pr_sha=$pr_sha" >> "$GITHUB_OUTPUT"
+
+      - name: React to comment
+        if: steps.check.outputs.should_plan == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api "repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" \
+            -X POST -f content='+1'
+
+      - name: Skip (not a /supa-plan comment)
+        if: |
+          github.event_name == 'issue_comment' &&
+          !startsWith(github.event.comment.body, '/supa-plan')
+        run: echo "Not a /supa-plan comment, skipping"
+
   discover:
     runs-on: ubuntu-latest
+    needs: check-trigger
+    if: |
+      (github.event_name == 'pull_request') ||
+      (github.event_name == 'issue_comment' && needs.check-trigger.outputs.should_plan == 'true')
     outputs:
       matrix: ${{ steps.find-projects.outputs.matrix }}
       has_projects: ${{ steps.find-projects.outputs.has_projects }}
+      pr_number: ${{ steps.resolve-context.outputs.pr_number }}
+      pr_sha: ${{ steps.resolve-context.outputs.pr_sha }}
     steps:
+      - name: Resolve context
+        id: resolve-context
+        run: |
+          if [ "${{ github.event_name }}" = "issue_comment" ]; then
+            echo "pr_number=${{ needs.check-trigger.outputs.pr_number }}" >> "$GITHUB_OUTPUT"
+            echo "pr_sha=${{ needs.check-trigger.outputs.pr_sha }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "pr_number=${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+            echo "pr_sha=${{ github.event.pull_request.head.sha }}" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/checkout@v4
         with:
+          ref: ${{ steps.resolve-context.outputs.pr_sha }}
           fetch-depth: 0
 
       - name: Find changed project directories
         id: find-projects
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ steps.resolve-context.outputs.pr_number }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ steps.resolve-context.outputs.pr_sha }}
           PROJECTS_DIR: ${{ inputs.projects_dir || 'projects' }}
         run: |
-          changed=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- "${PROJECTS_DIR}/")
+          if [ "${{ github.event_name }}" = "issue_comment" ]; then
+            base_sha=$(gh api "repos/${{ github.repository }}/pulls/$PR_NUMBER" --jq '.base.sha')
+          else
+            base_sha="${{ github.event.pull_request.base.sha }}"
+          fi
+          changed=$(git diff --name-only "$base_sha" "$HEAD_SHA" -- "${PROJECTS_DIR}/")
           dirs=$(echo "$changed" | grep -oP "^${PROJECTS_DIR}/[^/]+" | sort -u)
 
           matrix_entries=""
@@ -50,14 +127,12 @@ jobs:
               continue
             fi
 
-            project_ref=$(jq -r '.project_ref // ""' "$project_json")
+            project_ref=$(jq -r '.project_ref' "$project_json")
             project_name=$(jq -r '.project_name // ""' "$project_json")
             env_name=$(jq -r '.environment // "unknown"' "$project_json")
-            delete_flag=$(jq -r '.delete // false' "$project_json")
 
-            # delete=true requires a ref to know what to delete
-            if [ "$delete_flag" = "true" ] && [ -z "$project_ref" ]; then
-              echo "::warning::$dir has delete: true but no project_ref, skipping"
+            if [ -z "$project_ref" ]; then
+              echo "::warning::$dir/project.json has no project_ref, skipping"
               continue
             fi
 
@@ -66,8 +141,7 @@ jobs:
               --arg ref "$project_ref" \
               --arg name "$project_name" \
               --arg env "$env_name" \
-              --arg del "$delete_flag" \
-              '{"dir": $dir, "project_ref": $ref, "project_name": $name, "environment": $env, "delete": $del}')
+              '{"dir": $dir, "project_ref": $ref, "project_name": $name, "environment": $env}')
 
             if [ -n "$matrix_entries" ]; then
               matrix_entries="${matrix_entries},${entry}"
@@ -97,12 +171,14 @@ jobs:
       pull-requests: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.discover.outputs.pr_sha }}
 
       - name: Check for missing token
         env:
           SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_NUMBER: ${{ needs.discover.outputs.pr_number }}
           PROJECT_REF: ${{ matrix.project_ref }}
           PROJECT_NAME: ${{ matrix.project_name }}
           ENVIRONMENT: ${{ matrix.environment }}
@@ -134,7 +210,7 @@ jobs:
 
       - name: Run plan
         id: plan
-        uses: yeahwick/supabase-admin@fix-pr-apply-action-ref
+        uses: yeahwick/supabase-admin@main
         with:
           mode: plan
           project_ref: ${{ matrix.project_ref }}
@@ -142,7 +218,6 @@ jobs:
           schema_dir: ${{ matrix.dir }}/migrations
           functions_dir: ${{ matrix.dir }}/functions
           plan_output_file: /tmp/plan.json
-          delete: ${{ matrix.delete }}
           supabase_token: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
 
       - name: Build comment markdown
@@ -152,46 +227,28 @@ jobs:
           PROJECT_NAME: ${{ matrix.project_name }}
           ENVIRONMENT: ${{ matrix.environment }}
           PROJECT_REF: ${{ matrix.project_ref }}
-          PROJECT_DIR: ${{ matrix.dir }}
-          PR_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_SHA: ${{ needs.discover.outputs.pr_sha }}
           HAS_CHANGES: ${{ steps.plan.outputs.has_changes }}
         run: |
           short_sha="${PR_SHA:0:7}"
-          # Marker uses ref when present, else dir (for create plans without a ref yet)
-          marker_id="${PROJECT_REF:-$PROJECT_DIR}"
-          comment="<!-- supa-plan:${marker_id} -->"$'\n'
+          comment="<!-- supa-plan:${PROJECT_REF} -->"$'\n'
 
           if [ -n "$PROJECT_NAME" ]; then
             header="$PROJECT_NAME"
-          elif [ -n "$PROJECT_REF" ]; then
-            header="$PROJECT_REF"
           else
-            header="$PROJECT_DIR"
+            header="$PROJECT_REF"
           fi
           if [ "$ENVIRONMENT" != "unknown" ] && [ -n "$ENVIRONMENT" ]; then
             header="$header ($ENVIRONMENT)"
           fi
 
-          plan=$(cat "$PLAN_FILE" 2>/dev/null || echo '{}')
-          project_action=$(echo "$plan" | jq -r '.project_action // "update"')
-
           comment+="## Supabase Plan: ${header}"$'\n'
           comment+="> Planned for commit \`${short_sha}\`"$'\n\n'
 
-          if [ "$project_action" = "delete" ]; then
-            comment+=":rotating_light: **This project will be DELETED on merge.**"$'\n\n'
-            comment+="Project ref \`${PROJECT_REF}\` will be permanently destroyed. All databases, storage, functions, and configuration will be lost."$'\n\n'
-            comment+="---"$'\n'
-            comment+="Comment \`/supa-apply\` to confirm and apply this deletion."$'\n'
-          elif [ "$project_action" = "create" ]; then
-            comment+=":sparkles: **A new project will be created on merge.**"$'\n\n'
-            comment+="The following will be provisioned:"$'\n\n'
-          fi
-
-          if [ "$project_action" != "delete" ] && [ "$HAS_CHANGES" != "true" ]; then
+          if [ "$HAS_CHANGES" != "true" ]; then
             comment+="Everything is up to date. No changes will be applied on merge."$'\n'
-          elif [ "$project_action" != "delete" ]; then
-            :
+          else
+            plan=$(cat "$PLAN_FILE")
 
             # Config sections with table diffs
             for section in auth postgrest realtime storage-config; do
@@ -219,15 +276,6 @@ jobs:
                   comment+="| \`$k\` | \`$current\` | \`$desired\` |"$'\n'
                 done
                 comment+=$'\n'
-              elif [ "$status" = "create" ]; then
-                comment+="### ${nice_name} — :sparkles: will be created"$'\n'
-                comment+="| Key | Desired |"$'\n'
-                comment+="|-----|---------|"$'\n'
-                for k in $(echo "$plan" | jq -r ".changes.\"$key\".desired | keys[]"); do
-                  desired=$(echo "$plan" | jq -c ".changes.\"$key\".desired.\"$k\"")
-                  comment+="| \`$k\` | \`$desired\` |"$'\n'
-                done
-                comment+=$'\n'
               fi
             done
 
@@ -235,12 +283,8 @@ jobs:
             net_status=$(echo "$plan" | jq -r '.changes.network.status // "absent"')
             if [ "$net_status" = "no-change" ]; then
               comment+="### Network Restrictions — no changes"$'\n\n'
-            elif [ "$net_status" = "changed" ] || [ "$net_status" = "create" ]; then
-              if [ "$net_status" = "create" ]; then
-                comment+="### Network Restrictions — :sparkles: will be created"$'\n'
-              else
-                comment+="### Network Restrictions — :warning: changes detected"$'\n'
-              fi
+            elif [ "$net_status" = "changed" ]; then
+              comment+="### Network Restrictions — :warning: changes detected"$'\n'
               comment+="| Key | Current | Desired |"$'\n'
               comment+="|-----|---------|---------|"$'\n'
               current=$(echo "$plan" | jq -c '.changes.network.diff.dbAllowedCidrs.current')
@@ -252,12 +296,8 @@ jobs:
             ssl_status=$(echo "$plan" | jq -r '.changes.ssl.status // "absent"')
             if [ "$ssl_status" = "no-change" ]; then
               comment+="### SSL Enforcement — no changes"$'\n\n'
-            elif [ "$ssl_status" = "changed" ] || [ "$ssl_status" = "create" ]; then
-              if [ "$ssl_status" = "create" ]; then
-                comment+="### SSL Enforcement — :sparkles: will be created"$'\n'
-              else
-                comment+="### SSL Enforcement — :warning: changes detected"$'\n'
-              fi
+            elif [ "$ssl_status" = "changed" ]; then
+              comment+="### SSL Enforcement — :warning: changes detected"$'\n'
               current=$(echo "$plan" | jq -c '.changes.ssl.diff.requestedConfig.current')
               desired=$(echo "$plan" | jq -c '.changes.ssl.diff.requestedConfig.desired')
               comment+="| Key | Current | Desired |"$'\n'
@@ -329,7 +369,7 @@ jobs:
             fi
 
             comment+="---"$'\n'
-            comment+="Comment \`/supa-apply\` to apply these changes."$'\n'
+            comment+="Comment \`/supa-apply\` to apply these changes, or \`/supa-plan\` to re-run the plan."$'\n'
           fi
 
           # Write to output using delimiter
@@ -342,14 +382,14 @@ jobs:
         id: find-comment
         uses: peter-evans/find-comment@v3
         with:
-          issue-number: ${{ github.event.pull_request.number }}
+          issue-number: ${{ needs.discover.outputs.pr_number }}
           comment-author: 'github-actions[bot]'
-          body-includes: ${{ format('<!-- supa-plan:{0} -->', matrix.project_ref || matrix.dir) }}
+          body-includes: '<!-- supa-plan:${{ matrix.project_ref }} -->'
 
       - name: Create or update PR comment
         uses: peter-evans/create-or-update-comment@v4
         with:
           comment-id: ${{ steps.find-comment.outputs.comment-id }}
-          issue-number: ${{ github.event.pull_request.number }}
+          issue-number: ${{ needs.discover.outputs.pr_number }}
           body: ${{ steps.build-comment.outputs.comment_body }}
           edit-mode: replace
