@@ -70,33 +70,122 @@ jobs:
 
 That's it. Pushing changes to `.supabase/` will automatically apply them to your Supabase project.
 
-## Multi-project GitOps workflow
+## PR plan and apply workflows
 
-If you manage multiple Supabase projects in one repo, the included workflows give you a full GitOps loop with PR-time plan previews and `/supa-apply` apply commands.
+You can set up PR-triggered plan previews and apply commands in your own repo using this action and the included `check-trigger` composite action.
 
-### How it works
+### Single-project setup
 
-| Workflow | Trigger | What it does |
+Add two workflow files to your repo:
+
+**`.github/workflows/supabase-plan.yml`** — posts a plan comment on PRs:
+
+```yaml
+name: Supabase Plan
+on:
+  pull_request:
+    paths: ['.supabase/**']
+    types: [opened, synchronize, reopened]
+  issue_comment:
+    types: [created]
+
+jobs:
+  plan:
+    if: github.event_name == 'pull_request' || (github.event.issue.pull_request && startsWith(github.event.comment.body, '/supa-plan'))
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: read
+    steps:
+      - uses: yeahwick/supabase-admin/.github/actions/check-trigger@main
+        id: trigger
+        with:
+          command: '/supa-plan'
+
+      - uses: actions/checkout@v4
+        if: steps.trigger.outputs.allowed == 'true'
+        with:
+          ref: ${{ steps.trigger.outputs.pr_sha }}
+
+      - uses: yeahwick/supabase-admin@main
+        if: steps.trigger.outputs.allowed == 'true'
+        with:
+          mode: plan
+          project_ref: ${{ vars.SUPABASE_PROJECT_REF }}
+          config_dir: .supabase
+          plan_output_file: /tmp/plan.json
+          plan_comment_file: /tmp/plan-comment.md
+          project_name: ${{ vars.SUPABASE_PROJECT_NAME }}
+          environment: ${{ vars.SUPABASE_ENVIRONMENT }}
+          supabase_token: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+
+      - name: Post plan comment
+        if: steps.trigger.outputs.allowed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.trigger.outputs.pr_number }}
+        run: gh pr comment "$PR_NUMBER" --body-file /tmp/plan-comment.md
+```
+
+**`.github/workflows/supabase-apply.yml`** — applies changes on `/supa-apply` comment:
+
+```yaml
+name: Supabase Apply
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  apply:
+    if: github.event.issue.pull_request && startsWith(github.event.comment.body, '/supa-apply')
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: read
+    steps:
+      - uses: yeahwick/supabase-admin/.github/actions/check-trigger@main
+        id: trigger
+        with:
+          command: '/supa-apply'
+
+      - uses: actions/checkout@v4
+        if: steps.trigger.outputs.allowed == 'true'
+        with:
+          ref: ${{ steps.trigger.outputs.pr_sha }}
+
+      - uses: yeahwick/supabase-admin@main
+        if: steps.trigger.outputs.allowed == 'true'
+        with:
+          mode: apply
+          project_ref: ${{ vars.SUPABASE_PROJECT_REF }}
+          config_dir: .supabase
+          schema_dir: .supabase/migrations
+          functions_dir: .supabase/functions
+          supabase_token: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+
+      - name: Post result
+        if: always() && steps.trigger.outputs.allowed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.trigger.outputs.pr_number }}
+        run: |
+          if [ "${{ steps.supabase.outcome }}" = "success" ]; then
+            gh pr comment "$PR_NUMBER" --body "Applied successfully."
+          else
+            gh pr comment "$PR_NUMBER" --body "Apply **failed**. [View run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+          fi
+```
+
+### What you need to configure
+
+| Setting | Where | Description |
 |---|---|---|
-| `pr-plan.yml` | PR opened/updated touching `projects/**` | Posts a diff comment showing what would change |
-| `pr-apply.yml` | `/supa-apply` comment on a PR | Applies changes immediately (write-access only) |
-| `apply-on-merge.yml` | Push to `main` touching `projects/**` | Auto-applies on merge |
+| `SUPABASE_ACCESS_TOKEN` | Repo secret | Personal Access Token from [supabase.com/dashboard/account/tokens](https://supabase.com/dashboard/account/tokens) |
+| `SUPABASE_PROJECT_REF` | Repo variable | Your project reference ID |
+| `SUPABASE_PROJECT_NAME` | Repo variable *(optional)* | Project name shown in plan comments |
+| `SUPABASE_ENVIRONMENT` | Repo variable *(optional)* | Environment label (e.g. `staging`, `production`) |
 
-### Setup
-
-#### 1. Add the workflows to your repo
-
-Copy `.github/workflows/pr-plan.yml`, `pr-apply.yml`, and `apply-on-merge.yml` from this repo into your own.
-
-#### 2. Add your Supabase access token
-
-Go to **Settings > Secrets and variables > Actions** and add:
-
-| Secret name | Value |
-|---|---|
-| `SUPABASE_ACCESS_TOKEN` | Personal Access Token from [supabase.com/dashboard/account/tokens](https://supabase.com/dashboard/account/tokens) |
-
-#### 3. Set up a project directory
+### Multi-project setup
 
 Create a directory under `projects/` for each Supabase project you want to manage. Add a `project.json` file for auto-discovery:
 
@@ -167,7 +256,8 @@ Comment `/supa-apply` to apply these changes.
 | `project_ref` | No* | — | Supabase project reference ID. *Required when mode is `apply`. In `plan` mode, leave empty to plan a new project. |
 | `delete` | No | `false` | When `"true"`, plan/apply will destroy the project (`DELETE /v1/projects/<ref>`) and skip all config steps. Used by PR workflows when `delete: true` is set in `project.json`. |
 | `organization_id` | No* | — | Supabase organization ID. *Required when mode is `create` |
-| `project_name` | No* | — | Name for the new project. *Required when mode is `create` |
+| `project_name` | No | — | Name for the new project (*required when mode is `create`*). Also used as the header in plan comments. |
+| `environment` | No | — | Environment label (e.g. `staging`, `production`) shown in plan comment headers |
 | `region` | No | `us-east-1` | Region for the new project (only used with `create`) |
 | `db_password` | No* | — | Database password. *Required when mode is `create` |
 | `config_dir` | No | `.supabase` | Directory containing config JSON files |
@@ -175,6 +265,8 @@ Comment `/supa-apply` to apply these changes.
 | `secrets_file` | No | — | Path to JSON file with secrets to push |
 | `secrets` | No | — | JSON string of secrets (e.g. `'{"KEY": "value"}'`). Supports `${{ secrets.X }}` expressions. Takes precedence over `secrets_file` |
 | `functions_dir` | No | — | Directory containing edge function subdirectories |
+| `plan_output_file` | No | — | Path to write JSON plan output. Only used when mode is `plan` |
+| `plan_comment_file` | No | — | Path to write markdown plan comment (for posting to PRs). Only used when mode is `plan`. Requires `plan_output_file` to also be set. |
 | `supabase_token` | Yes | — | Supabase Personal Access Token |
 
 ## Action outputs
@@ -187,6 +279,7 @@ All outputs are available after the action runs, regardless of mode.
 | `project_url` | Project API URL (`https://<ref>.supabase.co`) |
 | `anon_key` | Public anon API key |
 | `service_role_key` | Service role API key (use carefully) |
+| `has_changes` | Whether the plan detected any changes (only set in plan mode) |
 
 Keys are automatically masked in workflow logs.
 
@@ -544,26 +637,17 @@ jobs:
 
 ## PR workflows
 
-When using this repo directly (with per-project configs in `projects/`), two PR workflows are included:
-
-### Plan on PR (`pr-plan.yml`)
-
-Automatically comments on PRs with a preview of changes when files under `projects/` are modified. This runs the action in `plan` mode to show what would change without applying anything.
-
-### Apply from PR (`pr-apply.yml`)
-
-Comment `/supa-apply` on a PR to apply changes from the PR branch to your Supabase projects. Only collaborators with **write** access or higher can trigger it.
-
-```
-/supa-apply              # Apply all changed projects
-/supa-apply staging      # Apply only the project matching environment or name "staging"
-```
-
-The workflow discovers which `projects/` directories changed in the PR, reads each `project.json` for the project ref, and applies the config. Status and results are posted as PR comments.
+Set up PR-triggered plan previews and apply commands using the `check-trigger` composite action and `plan` mode. See the [PR plan and apply workflows](#pr-plan-and-apply-workflows) section above for setup instructions.
 
 ## Using this repo directly
 
-This repo also includes inspection and mutation workflows for centralized management of multiple Supabase projects. See the `.github/workflows/` directory and the `projects/` directory for per-project config examples.
+This repo manages its own Supabase projects under `projects/` with three workflows:
+
+| Workflow | Trigger | What it does |
+|---|---|---|
+| `pr-plan.yml` | PR opened/updated or `/supa-plan` comment | Plans changes across all affected projects, posts diff comments |
+| `pr-apply.yml` | `/supa-apply` comment on a PR | Applies changes to affected projects (write-access only) |
+| `apply-on-merge.yml` | Push to `main` touching `projects/**` | Auto-applies all changed projects on merge |
 
 ### PR plan/apply lifecycle
 

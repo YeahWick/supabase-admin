@@ -7,69 +7,27 @@ on:
     types: [opened, synchronize, reopened]
   issue_comment:
     types: [created]
-  workflow_call:
-    inputs:
-      projects_dir:
-        description: 'Directory containing Supabase project subdirectories'
-        required: false
-        type: string
-        default: 'projects'
-    secrets:
-      SUPABASE_ACCESS_TOKEN:
-        description: 'Supabase Personal Access Token'
-        required: true
 
 jobs:
   check-trigger:
     runs-on: ubuntu-latest
     if: github.event_name == 'issue_comment'
     outputs:
-      should_plan: ${{ steps.check.outputs.should_plan }}
-      pr_number: ${{ steps.check.outputs.pr_number }}
-      pr_sha: ${{ steps.check.outputs.pr_sha }}
+      should_plan: ${{ steps.trigger.outputs.allowed }}
+      pr_number: ${{ steps.trigger.outputs.pr_number }}
+      pr_sha: ${{ steps.trigger.outputs.pr_sha }}
     permissions:
       issues: write
       pull-requests: write
       contents: read
     steps:
-      - name: Check permission and parse command
-        id: check
-        if: |
-          github.event.issue.pull_request &&
-          startsWith(github.event.comment.body, '/supa-plan')
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          COMMENTER: ${{ github.event.comment.user.login }}
-          PR_NUMBER: ${{ github.event.issue.number }}
-        run: |
-          # Check write permission
-          permission=$(gh api "repos/${{ github.repository }}/collaborators/$COMMENTER/permission" --jq '.permission' 2>/dev/null || echo "none")
-          if [[ "$permission" != "write" && "$permission" != "admin" && "$permission" != "maintain" ]]; then
-            echo "::warning::$COMMENTER does not have write access, ignoring /supa-plan"
-            echo "should_plan=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+      - uses: actions/checkout@v4
 
-          # Get current HEAD SHA of the PR
-          pr_sha=$(gh api "repos/${{ github.repository }}/pulls/$PR_NUMBER" --jq '.head.sha')
-
-          echo "should_plan=true" >> "$GITHUB_OUTPUT"
-          echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
-          echo "pr_sha=$pr_sha" >> "$GITHUB_OUTPUT"
-
-      - name: React to comment
-        if: steps.check.outputs.should_plan == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh api "repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" \
-            -X POST -f content='+1'
-
-      - name: Skip (not a /supa-plan comment)
-        if: |
-          github.event_name == 'issue_comment' &&
-          !startsWith(github.event.comment.body, '/supa-plan')
-        run: echo "Not a /supa-plan comment, skipping"
+      - name: Check trigger
+        id: trigger
+        uses: ./.github/actions/check-trigger
+        with:
+          command: '/supa-plan'
 
   discover:
     runs-on: ubuntu-latest
@@ -105,15 +63,14 @@ jobs:
           PR_NUMBER: ${{ steps.resolve-context.outputs.pr_number }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HEAD_SHA: ${{ steps.resolve-context.outputs.pr_sha }}
-          PROJECTS_DIR: ${{ inputs.projects_dir || 'projects' }}
         run: |
           if [ "${{ github.event_name }}" = "issue_comment" ]; then
             base_sha=$(gh api "repos/${{ github.repository }}/pulls/$PR_NUMBER" --jq '.base.sha')
           else
             base_sha="${{ github.event.pull_request.base.sha }}"
           fi
-          changed=$(git diff --name-only "$base_sha" "$HEAD_SHA" -- "${PROJECTS_DIR}/")
-          dirs=$(echo "$changed" | grep -oP "^${PROJECTS_DIR}/[^/]+" | sort -u)
+          changed=$(git diff --name-only "$base_sha" "$HEAD_SHA" -- 'projects/')
+          dirs=$(echo "$changed" | grep -oP "^projects/[^/]+" | sort -u)
 
           matrix_entries=""
           count=0
@@ -210,7 +167,7 @@ jobs:
 
       - name: Run plan
         id: plan
-        uses: yeahwick/supabase-admin@main
+        uses: ./
         with:
           mode: plan
           project_ref: ${{ matrix.project_ref }}
@@ -218,165 +175,10 @@ jobs:
           schema_dir: ${{ matrix.dir }}/migrations
           functions_dir: ${{ matrix.dir }}/functions
           plan_output_file: /tmp/plan.json
+          plan_comment_file: /tmp/plan-comment.md
+          project_name: ${{ matrix.project_name }}
+          environment: ${{ matrix.environment }}
           supabase_token: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
-
-      - name: Build comment markdown
-        id: build-comment
-        env:
-          PLAN_FILE: /tmp/plan.json
-          PROJECT_NAME: ${{ matrix.project_name }}
-          ENVIRONMENT: ${{ matrix.environment }}
-          PROJECT_REF: ${{ matrix.project_ref }}
-          PR_SHA: ${{ needs.discover.outputs.pr_sha }}
-          HAS_CHANGES: ${{ steps.plan.outputs.has_changes }}
-        run: |
-          short_sha="${PR_SHA:0:7}"
-          comment="<!-- supa-plan:${PROJECT_REF} -->"$'\n'
-
-          if [ -n "$PROJECT_NAME" ]; then
-            header="$PROJECT_NAME"
-          else
-            header="$PROJECT_REF"
-          fi
-          if [ "$ENVIRONMENT" != "unknown" ] && [ -n "$ENVIRONMENT" ]; then
-            header="$header ($ENVIRONMENT)"
-          fi
-
-          comment+="## Supabase Plan: ${header}"$'\n'
-          comment+="> Planned for commit \`${short_sha}\`"$'\n\n'
-
-          if [ "$HAS_CHANGES" != "true" ]; then
-            comment+="Everything is up to date. No changes will be applied on merge."$'\n'
-          else
-            plan=$(cat "$PLAN_FILE")
-
-            # Config sections with table diffs
-            for section in auth postgrest realtime storage-config; do
-              nice_name=""
-              key="$section"
-              case "$section" in
-                auth) nice_name="Auth Config" ;;
-                postgrest) nice_name="PostgREST Config" ;;
-                realtime) nice_name="Realtime Config" ;;
-                storage-config) nice_name="Storage Config"; key="storage-config" ;;
-              esac
-
-              status=$(echo "$plan" | jq -r ".changes.\"$key\".status // \"absent\"")
-
-              if [ "$status" = "no-change" ]; then
-                comment+="### ${nice_name} — no changes"$'\n\n'
-              elif [ "$status" = "changed" ]; then
-                comment+="### ${nice_name} — :warning: changes detected"$'\n'
-                comment+="| Key | Current | Desired |"$'\n'
-                comment+="|-----|---------|---------|"$'\n'
-
-                for k in $(echo "$plan" | jq -r ".changes.\"$key\".diff | keys[]"); do
-                  current=$(echo "$plan" | jq -c ".changes.\"$key\".diff.\"$k\".current")
-                  desired=$(echo "$plan" | jq -c ".changes.\"$key\".diff.\"$k\".desired")
-                  comment+="| \`$k\` | \`$current\` | \`$desired\` |"$'\n'
-                done
-                comment+=$'\n'
-              fi
-            done
-
-            # Network restrictions
-            net_status=$(echo "$plan" | jq -r '.changes.network.status // "absent"')
-            if [ "$net_status" = "no-change" ]; then
-              comment+="### Network Restrictions — no changes"$'\n\n'
-            elif [ "$net_status" = "changed" ]; then
-              comment+="### Network Restrictions — :warning: changes detected"$'\n'
-              comment+="| Key | Current | Desired |"$'\n'
-              comment+="|-----|---------|---------|"$'\n'
-              current=$(echo "$plan" | jq -c '.changes.network.diff.dbAllowedCidrs.current')
-              desired=$(echo "$plan" | jq -c '.changes.network.diff.dbAllowedCidrs.desired')
-              comment+="| \`dbAllowedCidrs\` | \`$current\` | \`$desired\` |"$'\n\n'
-            fi
-
-            # SSL enforcement
-            ssl_status=$(echo "$plan" | jq -r '.changes.ssl.status // "absent"')
-            if [ "$ssl_status" = "no-change" ]; then
-              comment+="### SSL Enforcement — no changes"$'\n\n'
-            elif [ "$ssl_status" = "changed" ]; then
-              comment+="### SSL Enforcement — :warning: changes detected"$'\n'
-              current=$(echo "$plan" | jq -c '.changes.ssl.diff.requestedConfig.current')
-              desired=$(echo "$plan" | jq -c '.changes.ssl.diff.requestedConfig.desired')
-              comment+="| Key | Current | Desired |"$'\n'
-              comment+="|-----|---------|---------|"$'\n'
-              comment+="| \`requestedConfig\` | \`$current\` | \`$desired\` |"$'\n\n'
-            fi
-
-            # Storage buckets
-            buckets_status=$(echo "$plan" | jq -r '.changes."storage-buckets".status // "absent"')
-            if [ "$buckets_status" = "no-change" ]; then
-              comment+="### Storage Buckets — no changes"$'\n\n'
-            elif [ "$buckets_status" = "changed" ]; then
-              comment+="### Storage Buckets — :warning: changes detected"$'\n'
-              comment+="| Bucket | Action | Details |"$'\n'
-              comment+="|--------|--------|---------|"$'\n'
-
-              for row in $(echo "$plan" | jq -c '.changes."storage-buckets".buckets[]'); do
-                bname=$(echo "$row" | jq -r '.name')
-                baction=$(echo "$row" | jq -r '.action')
-                if [ "$baction" = "create" ]; then
-                  comment+="| \`$bname\` | **create** | — |"$'\n'
-                else
-                  changes=$(echo "$row" | jq -c '.changes // {}' | sed 's/"/`/g')
-                  comment+="| \`$bname\` | update | $changes |"$'\n'
-                fi
-              done
-              comment+=$'\n'
-            fi
-
-            # SQL migrations
-            mig_status=$(echo "$plan" | jq -r '.changes.migrations.status // "absent"')
-            if [ "$mig_status" = "no-change" ]; then
-              comment+="### SQL Migrations — no pending"$'\n\n'
-            elif [ "$mig_status" = "pending" ]; then
-              count=$(echo "$plan" | jq '.changes.migrations.pending | length')
-              comment+="### SQL Migrations — :warning: ${count} pending"$'\n'
-              for m in $(echo "$plan" | jq -r '.changes.migrations.pending[]'); do
-                comment+="- \`$m\`"$'\n'
-              done
-              comment+=$'\n'
-            fi
-
-            # Edge functions
-            func_status=$(echo "$plan" | jq -r '.changes.functions.status // "absent"')
-            if [ "$func_status" = "no-change" ]; then
-              comment+="### Edge Functions — no changes"$'\n\n'
-            elif [ "$func_status" = "changed" ]; then
-              comment+="### Edge Functions — :warning: changes detected"$'\n'
-              comment+="| Function | Action |"$'\n'
-              comment+="|----------|--------|"$'\n'
-              for row in $(echo "$plan" | jq -c '.changes.functions.functions[]'); do
-                fname=$(echo "$row" | jq -r '.name')
-                faction=$(echo "$row" | jq -r '.action')
-                if [ "$faction" = "create" ]; then
-                  comment+="| \`$fname\` | **create** |"$'\n'
-                else
-                  comment+="| \`$fname\` | update |"$'\n'
-                fi
-              done
-              comment+=$'\n'
-            fi
-
-            # Secrets
-            sec_status=$(echo "$plan" | jq -r '.changes.secrets.status // "absent"')
-            if [ "$sec_status" = "present" ]; then
-              sec_count=$(echo "$plan" | jq -r '.changes.secrets.key_count')
-              comment+="### Secrets — ${sec_count} key(s) present"$'\n'
-              comment+="> Secret values are not diffed. Apply to sync."$'\n\n'
-            fi
-
-            comment+="---"$'\n'
-            comment+="Comment \`/supa-apply\` to apply these changes, or \`/supa-plan\` to re-run the plan."$'\n'
-          fi
-
-          # Write to output using delimiter
-          delimiter="EOF_$(date +%s%N)"
-          echo "comment_body<<$delimiter" >> "$GITHUB_OUTPUT"
-          echo "$comment" >> "$GITHUB_OUTPUT"
-          echo "$delimiter" >> "$GITHUB_OUTPUT"
 
       - name: Find existing bot comment
         id: find-comment
@@ -391,5 +193,5 @@ jobs:
         with:
           comment-id: ${{ steps.find-comment.outputs.comment-id }}
           issue-number: ${{ needs.discover.outputs.pr_number }}
-          body: ${{ steps.build-comment.outputs.comment_body }}
+          body-path: /tmp/plan-comment.md
           edit-mode: replace

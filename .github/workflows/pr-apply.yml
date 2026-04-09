@@ -3,68 +3,28 @@ name: Apply Supabase Changes (PR Command)
 on:
   issue_comment:
     types: [created]
-  workflow_call:
-    inputs:
-      projects_dir:
-        description: 'Directory containing Supabase project subdirectories'
-        required: false
-        type: string
-        default: 'projects'
-    secrets:
-      SUPABASE_ACCESS_TOKEN:
-        description: 'Supabase Personal Access Token'
-        required: true
 
 jobs:
   check-trigger:
     runs-on: ubuntu-latest
-    if: |
-      github.event.issue.pull_request &&
-      startsWith(github.event.comment.body, '/supa-apply')
+    if: github.event.issue.pull_request && startsWith(github.event.comment.body, '/supa-apply')
     outputs:
-      should_apply: ${{ steps.check.outputs.should_apply }}
-      pr_number: ${{ steps.check.outputs.pr_number }}
-      pr_sha: ${{ steps.check.outputs.pr_sha }}
-      project_filter: ${{ steps.check.outputs.project_filter }}
+      should_apply: ${{ steps.trigger.outputs.allowed }}
+      pr_number: ${{ steps.trigger.outputs.pr_number }}
+      pr_sha: ${{ steps.trigger.outputs.pr_sha }}
+      project_filter: ${{ steps.trigger.outputs.project_filter }}
     permissions:
       issues: write
       pull-requests: write
       contents: read
     steps:
-      - name: Check permission and parse command
-        id: check
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          COMMENTER: ${{ github.event.comment.user.login }}
-          COMMENT_BODY: ${{ github.event.comment.body }}
-          PR_NUMBER: ${{ github.event.issue.number }}
-        run: |
-          # Check write permission
-          permission=$(gh api "repos/${{ github.repository }}/collaborators/$COMMENTER/permission" --jq '.permission' 2>/dev/null || echo "none")
-          if [[ "$permission" != "write" && "$permission" != "admin" && "$permission" != "maintain" ]]; then
-            echo "::warning::$COMMENTER does not have write access, ignoring /supa-apply"
-            echo "should_apply=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+      - uses: actions/checkout@v4
 
-          # Parse optional project filter: "/supa-apply staging" or "/supa-apply"
-          project_filter=$(echo "$COMMENT_BODY" | awk '{print $2}')
-
-          # Get current HEAD SHA of the PR
-          pr_sha=$(gh api "repos/${{ github.repository }}/pulls/$PR_NUMBER" --jq '.head.sha')
-
-          echo "should_apply=true" >> "$GITHUB_OUTPUT"
-          echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
-          echo "pr_sha=$pr_sha" >> "$GITHUB_OUTPUT"
-          echo "project_filter=$project_filter" >> "$GITHUB_OUTPUT"
-
-      - name: React to comment
-        if: steps.check.outputs.should_apply == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh api "repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" \
-            -X POST -f content='+1'
+      - name: Check trigger
+        id: trigger
+        uses: ./.github/actions/check-trigger
+        with:
+          command: '/supa-apply'
 
   discover:
     needs: check-trigger
@@ -89,11 +49,10 @@ jobs:
           PROJECT_FILTER: ${{ needs.check-trigger.outputs.project_filter }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_SHA: ${{ needs.check-trigger.outputs.pr_sha }}
-          PROJECTS_DIR: ${{ inputs.projects_dir || 'projects' }}
         run: |
           base_sha=$(gh api "repos/${{ github.repository }}/pulls/$PR_NUMBER" --jq '.base.sha')
-          changed=$(git diff --name-only "$base_sha" "$PR_SHA" -- "${PROJECTS_DIR}/")
-          dirs=$(echo "$changed" | grep -oP "^${PROJECTS_DIR}/[^/]+" | sort -u)
+          changed=$(git diff --name-only "$base_sha" "$PR_SHA" -- 'projects/')
+          dirs=$(echo "$changed" | grep -oP "^projects/[^/]+" | sort -u)
 
           matrix_entries=""
           count=0
@@ -108,14 +67,11 @@ jobs:
             env_name=$(jq -r '.environment // "unknown"' "$project_json")
             delete_flag=$(jq -r '.delete // false' "$project_json")
 
-            # pr-apply doesn't auto-create projects (no org/db_password inputs).
-            # Skip if no ref.
             if [ -z "$project_ref" ]; then
               echo "Skipping $dir (no project_ref; create projects manually with mode=create)"
               continue
             fi
 
-            # Apply project filter if specified
             if [ -n "$PROJECT_FILTER" ]; then
               if [ "$env_name" != "$PROJECT_FILTER" ] && [ "$project_name" != "$PROJECT_FILTER" ]; then
                 echo "Skipping $dir (filter: $PROJECT_FILTER)"
@@ -215,7 +171,7 @@ jobs:
 
       - name: Apply config
         id: apply
-        uses: yeahwick/supabase-admin@fix-pr-apply-action-ref
+        uses: ./
         with:
           mode: apply
           project_ref: ${{ matrix.project_ref }}
