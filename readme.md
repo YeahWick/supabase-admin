@@ -115,7 +115,7 @@ jobs:
           config_dir: .supabase
           plan_output_file: /tmp/plan.json
           plan_comment_file: /tmp/plan-comment.md
-          project_name: ${{ vars.SUPABASE_PROJECT_NAME }}
+          plan_project_name: ${{ vars.SUPABASE_PROJECT_NAME }}
           environment: ${{ vars.SUPABASE_ENVIRONMENT }}
           supabase_token: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
 
@@ -256,7 +256,8 @@ Comment `/supa-apply` to apply these changes.
 | `project_ref` | No* | — | Supabase project reference ID. *Required when mode is `apply`. In `plan` mode, leave empty to plan a new project. |
 | `delete` | No | `false` | When `"true"`, plan/apply will destroy the project (`DELETE /v1/projects/<ref>`) and skip all config steps. Used by PR workflows when `delete: true` is set in `project.json`. |
 | `organization_id` | No* | — | Supabase organization ID. *Required when mode is `create` |
-| `project_name` | No | — | Name for the new project (*required when mode is `create`*). Also used as the header in plan comments. |
+| `project_name` | No | — | Name for the new project (*required when mode is `create`*). |
+| `plan_project_name` | No | — | Human-readable name shown in PR plan comment headers. |
 | `environment` | No | — | Environment label (e.g. `staging`, `production`) shown in plan comment headers |
 | `region` | No | `us-east-1` | Region for the new project (only used with `create`) |
 | `db_password` | No* | — | Database password. *Required when mode is `create` |
